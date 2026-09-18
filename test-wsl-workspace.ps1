@@ -12,11 +12,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $fixtureId = [Guid]::NewGuid().ToString('N')
-$fixtureBase = Join-Path ([IO.Path]::GetTempPath()) "unison-wsl-it-$fixtureId"
+$fixtureBase = Join-Path ([IO.Path]::GetTempPath()) "unison-wsl-test-$fixtureId"
 $windowsRoot = Join-Path $fixtureBase 'windows'
 $configDir = Join-Path $fixtureBase 'config'
-$linuxRoot = "/tmp/unison-wsl-it-$fixtureId"
-$wslRoot = "\\wsl.localhost\$Distro\tmp\unison-wsl-it-$fixtureId"
+$linuxRoot = "/tmp/unison-wsl-test-$fixtureId"
+$wslRoot = "\\wsl.localhost\$Distro\tmp\unison-wsl-test-$fixtureId"
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -56,6 +56,33 @@ function Invoke-WorkspaceSync {
         throw "Unison failed with exit code $exitCode`n$output"
     }
     [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+}
+
+function Invoke-NativeSelfTest {
+    # This deliberately does not enable -wslworkspace.  The full upstream
+    # self-test exercises ordinary Unison semantics, while the focused
+    # Gitrepo/Fs tests now included in it exercise the native confined-handle
+    # primitive against both disposable local roots, including this WSL UNC
+    # fixture.  Enabling the dedicated mode would intentionally hard-ignore
+    # .git and change unrelated upstream atomic-directory self-tests.
+    $arguments = @(
+        $windowsRoot,
+        $wslRoot,
+        '-selftest',
+        '-batch',
+        '-confirmbigdel=false'
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = (& $UnisonExe @arguments 2>&1 | Out-String)
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native Unison self-test failed with exit code $LASTEXITCODE`n$output"
+    }
 }
 
 function Write-Utf8Bytes {
@@ -113,7 +140,9 @@ try {
     Assert-True ($symlink.Output -match '(?i)reparse point|symbolic link') `
         'The escaping Linux symlink was not reported'
 
-    Write-Host 'Disposable Windows/WSL workspace smoke tests passed.'
+    Invoke-NativeSelfTest
+
+    Write-Host 'Disposable Windows/WSL workspace smoke tests and native self-test passed.'
 }
 finally {
     $env:UNISON = $oldUnison
@@ -122,10 +151,10 @@ finally {
         Write-Host "Kept WSL fixture: $linuxRoot"
     }
     else {
-        if ($fixtureBase -like "*unison-wsl-it-$fixtureId*") {
+        if ($fixtureBase -like "*unison-wsl-test-$fixtureId*") {
             Remove-Item -LiteralPath $fixtureBase -Recurse -Force -ErrorAction SilentlyContinue
         }
-        if ($linuxRoot -match '^/tmp/unison-wsl-it-[0-9a-f]{32}$') {
+        if ($linuxRoot -match '^/tmp/unison-wsl-test-[0-9a-f]{32}$') {
             & wsl.exe -d $Distro -- rm -rf -- $linuxRoot
         }
     }

@@ -33,6 +33,109 @@ let argv () = Sys.argv
 
 type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
 
+type confined_kind = ConfinedFile | ConfinedDirectory
+
+(* This fallback keeps the same handle-consuming API for non-Windows unit
+ * tests.  It is deliberately not described as a confinement primitive: the
+ * dedicated wslworkspace mode refuses to run on non-Windows builds. *)
+type confined_handle =
+  | ConfinedFileHandle of Unix.file_descr
+  | ConfinedDirectoryHandle of string * Unix.dir_handle
+
+let confinedComponentValid name =
+  let length = String.length name in
+  length > 0 && name <> "." && name <> ".." &&
+  not (String.contains name '\000') &&
+  not (String.contains name '/') &&
+  not (String.contains name '\\') &&
+  not (String.contains name ':')
+
+let confinedPath root components =
+  if not (List.for_all confinedComponentValid components) then
+    invalid_arg "invalid confined path component";
+  List.fold_left Filename.concat root components
+
+let confinedNoFollow path =
+  let stat = Unix.LargeFile.lstat path in
+  if stat.Unix.LargeFile.st_kind = Unix.S_LNK then
+    raise (Unix.Unix_error (Unix.ELOOP, "confinedOpen", path));
+  stat
+
+let confinedOpen root components =
+  try
+    let rec checkPrefixes prefix = function
+      | [] -> confinedNoFollow prefix
+      | name :: rest ->
+          let path = Filename.concat prefix name in
+          ignore (confinedNoFollow path);
+          checkPrefixes path rest in
+    let path = confinedPath root components in
+    let stat = checkPrefixes root components in
+    match stat.Unix.LargeFile.st_kind with
+    | Unix.S_REG ->
+        Some (ConfinedFileHandle
+          (Unix.openfile path [Unix.O_RDONLY; Unix.O_BINARY] 0))
+    | Unix.S_DIR -> Some (ConfinedDirectoryHandle (path, Unix.opendir path))
+    | _ -> raise (Unix.Unix_error (Unix.EINVAL, "confinedOpen", path))
+  with Unix.Unix_error ((Unix.ENOENT | Unix.ENOTDIR), _, _) -> None
+
+let confinedOpenChild handle name =
+  if not (confinedComponentValid name) then
+    invalid_arg "invalid confined path component";
+  match handle with
+  | ConfinedFileHandle _ ->
+      raise (Unix.Unix_error (Unix.ENOTDIR, "confinedOpenChild", name))
+  | ConfinedDirectoryHandle (directoryPath, directory) ->
+      (* POSIX Unix does not expose an opendir-relative primitive through the
+       * OCaml Unix module.  This is a test-only fallback; Windows has the
+       * handle-relative implementation used by wslworkspace. *)
+      ignore directory;
+      confinedOpen directoryPath [name]
+
+let confinedKind = function
+  | ConfinedFileHandle _ -> ConfinedFile
+  | ConfinedDirectoryHandle _ -> ConfinedDirectory
+
+let confinedRead handle maximum =
+  match handle with
+  | ConfinedDirectoryHandle _ ->
+      raise (Unix.Unix_error (Unix.EISDIR, "confinedRead", ""))
+  | ConfinedFileHandle descriptor ->
+      if maximum < 0 then invalid_arg "negative confined read limit";
+      let stat = Unix.LargeFile.fstat descriptor in
+      if stat.Unix.LargeFile.st_size > Int64.of_int maximum then
+        raise (Unix.Unix_error (Unix.EFBIG, "confinedRead", ""));
+      let length = Int64.to_int stat.Unix.LargeFile.st_size in
+      let contents = Bytes.create length in
+      let rec read offset =
+        if offset = length then ()
+        else
+          let count = Unix.read descriptor contents offset (length - offset) in
+          if count = 0 then
+            raise (Unix.Unix_error (Unix.EIO, "confinedRead", ""));
+          read (offset + count) in
+      read 0;
+      let extra = Bytes.create 1 in
+      if Unix.read descriptor extra 0 1 <> 0 then
+        raise (Unix.Unix_error (Unix.EFBIG, "confinedRead", ""));
+      Bytes.to_string contents
+
+let confinedList handle =
+  match handle with
+  | ConfinedFileHandle _ ->
+      raise (Unix.Unix_error (Unix.ENOTDIR, "confinedList", ""))
+  | ConfinedDirectoryHandle (_, directory) ->
+      let rec loop names =
+        try
+          let name = Unix.readdir directory in
+          loop (name :: names)
+        with End_of_file -> List.rev names in
+      loop []
+
+let confinedClose = function
+  | ConfinedFileHandle descriptor -> Unix.close descriptor
+  | ConfinedDirectoryHandle (_, directory) -> Unix.closedir directory
+
 let stat = Unix.LargeFile.stat
 let lstat = Unix.LargeFile.lstat
 let isReparsePoint _ = false

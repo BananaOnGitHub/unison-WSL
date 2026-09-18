@@ -21,6 +21,14 @@ type fspath
 val mfspath : fspath Umarshal.t
 type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
 
+(* A read-only handle rooted at a path whose components were opened without
+ * following reparse points.  This is used only for security-sensitive
+ * metadata reads.  The Windows implementation uses NtCreateFile for the root
+ * and every child; non-Windows implementations exist for ordinary regression
+ * tests, but are not a confinement boundary. *)
+type confined_kind = ConfinedFile | ConfinedDirectory
+type confined_handle
+
 val symlink : string -> fspath -> unit
 val readlink : fspath -> string
 val chown : fspath -> int -> int -> unit
@@ -34,6 +42,18 @@ val stat : fspath -> Unix.LargeFile.stats
 val lstat : fspath -> Unix.LargeFile.stats
 (* True for a Windows reparse point. Other systems return false. *)
 val isReparsePoint : fspath -> bool
+
+(* Open [components] below the already trusted absolute [fspath].  On Windows
+ * this opens each component relative to the preceding handle with
+ * FILE_OPEN_REPARSE_POINT and fails closed for every reparse tag.  [None]
+ * denotes a missing component; all other failures are errors. *)
+val confinedOpen : fspath -> string list -> confined_handle option
+val confinedOpenChild : confined_handle -> string -> confined_handle option
+val confinedKind : confined_handle -> confined_kind
+val confinedRead : confined_handle -> int -> string
+val confinedList : confined_handle -> string list
+val confinedClose : confined_handle -> unit
+
 val opendir : fspath -> dir_handle
 val openfile :
   fspath -> Unix.open_flag list -> Unix.file_perm -> Unix.file_descr

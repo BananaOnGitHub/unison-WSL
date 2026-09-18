@@ -9,10 +9,6 @@ type inspection =
 
 module StringMap = Map.Make (String)
 
-let dotGit = Name.fromString ".git"
-
-let child dir name = Fspath.child dir (Name.fromString name)
-
 let startsWith s prefix =
   let length = String.length prefix in
   String.length s >= length && String.sub s 0 length = prefix
@@ -168,121 +164,78 @@ let parsePackedRefs contents =
   |> List.rev
 
 (* ---------------------------------------------------------------------------
-   Filesystem helpers — fail-closed, lstat-only
+   Filesystem helpers — Windows handle confinement
    ---------------------------------------------------------------------------
 
-   IMPORTANT — residual TOCTOU:
-   Each helper below calls Fs.lstat (which does NOT follow symlinks) to check
-   the kind of a path before opening it.  However, between the lstat call and
-   the subsequent open call the filesystem may be mutated by a racing adversary.
-   On Windows, closing this window requires handle-based confinement:
-   NtCreateFile with FILE_OPEN_REPARSE_POINT, followed by an explicit reparse-
-   tag check on the opened handle, with all subsequent operations going through
-   that handle rather than resolving names again.
-   That primitive is not currently available through OCaml's Unix or Fs layers.
+   Git metadata is untrusted whenever it resides on the WSL replica.  The
+   Windows Fs.confined* primitive opens the configured worktree once through
+   NtCreateFile and then opens every metadata child relative to the preceding
+   directory handle.  Each open uses OBJ_DONT_REPARSE and
+   FILE_OPEN_REPARSE_POINT, validates the actual opened handle (including a
+   reparse-tag query), and rejects every reparse tag.  File contents and
+   directory entries are read from that same handle; no pathname is reopened
+   after validation.
 
-   Until that confinement is implemented (a subsequent security milestone),
-   this code is intentionally fail-closed at the logical level — it will reject
-   malicious metadata it detects — but cannot guarantee detection in a race.
-   Do NOT use this code against adversarial live repositories on the real
-   workspace until handle-based confinement is in place.
+   The generic implementation only keeps this API usable for non-Windows
+   regression tests.  wslworkspace itself is native-Windows-only, so it never
+   relies on the generic implementation as a security boundary.
 *)
 
-(* lstat that returns None on ENOENT/ENOTDIR, raises on everything else.
-   Critically, does NOT follow symlinks (unlike Fs.file_exists which uses stat). *)
-let lstatNoFollow path =
-  try Some (Fs.lstat path)
-  with Unix.Unix_error ((Unix.ENOENT | Unix.ENOTDIR), _, _) -> None
+let metadataLimit = 1024 * 1024
 
-(* checkedLstat: lstat the path, then reject symlinks and reparse points.
-   Returns the stat on success. Raises Util.Transient if the path does not
-   exist or is a link/reparse. *)
-let checkedLstat path =
-  (* TOCTOU: see note above — the check and the later open are not atomic. *)
-  match lstatNoFollow path with
-  | None ->
-      raise (Unix.Unix_error (Unix.ENOENT, "lstat", Fspath.toPrintString path))
-  | Some stat ->
-      if stat.Unix.LargeFile.st_kind = Unix.S_LNK then
-        raise (Util.Transient
-          ("Git metadata contains a symbolic link: " ^ Fspath.toPrintString path));
-      (* Reparse-point check must come after lstat since isReparsePoint may
-         itself follow the path.  On non-Windows platforms it always returns false. *)
-      if Fs.isReparsePoint path then
-        raise (Util.Transient
-          ("Git metadata contains a reparse point: " ^ Fspath.toPrintString path));
-      stat
+let withHandle handle f =
+  protect (fun () -> Fs.confinedClose handle) (fun () -> f handle)
 
-(* lstat-based existence check: returns true iff the path exists and is
-   neither a symlink nor a reparse point.  Returns false on ENOENT.
-   Raises Util.Transient if the path IS a link or reparse point.
-   This replaces Fs.file_exists (which calls stat and thus follows symlinks). *)
-let existsNoFollow path =
-  match lstatNoFollow path with
-  | None -> false
-  | Some stat ->
-      if stat.Unix.LargeFile.st_kind = Unix.S_LNK then
-        raise (Util.Transient
-          ("Git metadata contains a symbolic link: " ^ Fspath.toPrintString path));
-      if Fs.isReparsePoint path then
-        raise (Util.Transient
-          ("Git metadata contains a reparse point: " ^ Fspath.toPrintString path));
-      true
+let withChild directory name f =
+  match Fs.confinedOpenChild directory name with
+  | None -> None
+  | Some handle -> Some (withHandle handle f)
 
-let readSmallFile path =
-  let stat = checkedLstat path in
-  if stat.Unix.LargeFile.st_kind <> Unix.S_REG then
-    raise (Util.Transient
-      ("Git metadata is not a regular file: " ^ Fspath.toPrintString path));
-  let size = Int64.to_int stat.Unix.LargeFile.st_size in
-  if size > 1024 * 1024 then
-    raise (Util.Transient
-      ("Git metadata file is unexpectedly large: " ^ Fspath.toPrintString path));
-  (* TOCTOU: see note above — open occurs after lstat, not through the handle. *)
-  let channel = Fs.open_in_bin path in
-  protect (fun () -> close_in_noerr channel) (fun () ->
-    really_input_string channel size)
+let requireChild directory name =
+  match Fs.confinedOpenChild directory name with
+  | Some handle -> handle
+  | None -> raise (Unix.Unix_error (Unix.ENOENT, "confinedOpenChild", name))
 
-let listDirectory path =
-  let stat = checkedLstat path in
-  if stat.Unix.LargeFile.st_kind <> Unix.S_DIR then
-    raise (Util.Transient
-      ("Git metadata is not a directory: " ^ Fspath.toPrintString path));
-  (* TOCTOU: see note above — opendir occurs after lstat. *)
-  let handle = Fs.opendir path in
-  protect (fun () -> handle.closedir ()) (fun () ->
-    let rec loop names =
-      try
-        let name = handle.readdir () in
-        if name = "." || name = ".." then loop names else loop (name :: names)
-      with End_of_file -> List.sort String.compare names
-    in
-    loop [])
+let expectDirectory label handle =
+  if Fs.confinedKind handle <> Fs.ConfinedDirectory then
+    raise (Util.Transient ("Git metadata is not a directory: " ^ label))
 
-let rec readLooseRefs gitDir relative =
-  let directory =
-    List.fold_left child gitDir (String.split_on_char '/' relative) in
-  listDirectory directory
+let expectFile label handle =
+  if Fs.confinedKind handle <> Fs.ConfinedFile then
+    raise (Util.Transient ("Git metadata is not a regular file: " ^ label))
+
+let readSmallFile label handle =
+  expectFile label handle;
+  Fs.confinedRead handle metadataLimit
+
+let listDirectory label handle =
+  expectDirectory label handle;
+  Fs.confinedList handle
+  |> List.filter (fun name -> name <> "." && name <> "..")
+  |> List.sort String.compare
+
+let rec readLooseRefs directory relative =
+  listDirectory relative directory
   |> List.fold_left (fun refs name ->
        (* Skip hidden files and lock files; they are not durable ref state. *)
        if startsWith name "." || Util.endswith name ".lock" then refs
        else
-         let path = child directory name in
-         let stat = checkedLstat path in
-         let fullName = relative ^ "/" ^ name in
-         match stat.Unix.LargeFile.st_kind with
-         | Unix.S_DIR ->
-             StringMap.union (fun _ _ loose -> Some loose) refs
-               (readLooseRefs gitDir fullName)
-         | Unix.S_REG when isSupportedRefName fullName ->
-             begin match parseRefValue (readSmallFile path) with
-             | Some value -> StringMap.add fullName value refs
-             | None -> raise (Util.Transient
-                 ("unsupported Git ref contents: " ^ Fspath.toPrintString path))
-             end
-         | Unix.S_REG -> refs   (* name not in supported subset — skip silently *)
-         | _ -> raise (Util.Transient
-             ("unsupported Git ref type: " ^ Fspath.toPrintString path)))
+         match withChild directory name (fun handle ->
+           let fullName = relative ^ "/" ^ name in
+           match Fs.confinedKind handle with
+           | Fs.ConfinedDirectory ->
+               StringMap.union (fun _ _ loose -> Some loose) refs
+                 (readLooseRefs handle fullName)
+           | Fs.ConfinedFile when isSupportedRefName fullName ->
+               begin match parseRefValue (readSmallFile fullName handle) with
+               | Some value -> StringMap.add fullName value refs
+               | None -> raise (Util.Transient
+                   ("unsupported Git ref contents: " ^ fullName))
+               end
+           | Fs.ConfinedFile -> refs
+         ) with
+         | None -> refs
+         | Some refs -> refs)
      StringMap.empty
 
 (* ---------------------------------------------------------------------------
@@ -299,8 +252,9 @@ let rec readLooseRefs gitDir relative =
    frequently as informational heads and do not reliably signal an in-progress
    operation.
 
-   Existence is checked with existsNoFollow to avoid following any symlink or
-   reparse point masquerading as a lock file.
+   Every probe is a confined handle open.  A replacement by a symlink/reparse
+   point therefore either leaves us on the existing handle or fails closed;
+   it cannot redirect the later metadata read.
 *)
 let isBusy gitDir =
   let names = [
@@ -312,74 +266,73 @@ let isBusy gitDir =
   let rec firstExisting = function
     | [] -> None
     | name :: rest ->
-        (* existsNoFollow raises on symlink/reparse, returns false on ENOENT *)
-        if existsNoFollow (child gitDir name) then Some name
-        else firstExisting rest in
+        begin match withChild gitDir name (fun _ -> ()) with
+        | Some () -> Some name
+        | None -> firstExisting rest
+        end in
   match firstExisting names with
   | Some name -> Some name
   | None ->
-      let rec findRefLock relative =
-        let directory =
-          List.fold_left child gitDir (String.split_on_char '/' relative) in
+      let rec findRefLock directory relative =
         let rec loop = function
           | [] -> None
           | name :: rest ->
-              let path = child directory name in
-              let stat = checkedLstat path in
               if Util.endswith name ".lock" then Some (relative ^ "/" ^ name)
-              else if stat.Unix.LargeFile.st_kind = Unix.S_DIR then begin
-                match findRefLock (relative ^ "/" ^ name) with
-                | None -> loop rest
-                | Some _ as found -> found
-              end else
-                loop rest in
-        loop (listDirectory directory) in
-      (* existsNoFollow: avoid following a symlink named "refs" *)
-      if existsNoFollow (child gitDir "refs") then findRefLock "refs" else None
+              else begin match withChild directory name (fun child ->
+                match Fs.confinedKind child with
+                | Fs.ConfinedDirectory -> findRefLock child (relative ^ "/" ^ name)
+                | Fs.ConfinedFile -> None) with
+              | Some (Some _ as found) -> found
+              | Some None | None -> loop rest
+              end in
+        loop (listDirectory relative directory) in
+      begin match withChild gitDir "refs" (fun refs ->
+        expectDirectory "refs" refs;
+        findRefLock refs "refs") with
+      | None -> None
+      | Some result -> result
+      end
 
 let inspect worktree =
   try
-    let gitDir = Fspath.child worktree dotGit in
-    (* Use lstat (via existsNoFollow) rather than file_exists (which calls stat
-       and thus follows a symlink or reparse point at this path). *)
-    if not (existsNoFollow gitDir) then Missing
-    else begin
-      let stat = checkedLstat gitDir in
-      if stat.Unix.LargeFile.st_kind <> Unix.S_DIR then
-        (* .git is a regular file: linked worktree gitfile or other unsupported form.
-           We do not follow gitfile indirection because the path it contains
-           is workspace-controlled and may escape the designated root. *)
-        Unsupported (".git exists but is not a directory: linked worktrees and \
-                      gitfile indirection are not supported")
-      else begin match isBusy gitDir with
-      | Some path -> Busy ("Git operation or lock is present: " ^ path)
-      | None ->
-          let headPath = child gitDir "HEAD" in
-          let head =
-            match parseRefValue (readSmallFile headPath) with
-            | Some value -> Gitstate.Present value
-            | None -> raise (Util.Transient "unsupported Git HEAD contents") in
-          let packed = child gitDir "packed-refs" in
-          let packedRefs =
-            (* existsNoFollow: reject a symlink or reparse point named packed-refs *)
-            if existsNoFollow packed then
-              List.fold_left (fun refs (name, value) -> StringMap.add name value refs)
-                StringMap.empty (parsePackedRefs (readSmallFile packed))
-            else
-              StringMap.empty in
-          let refs =
-            (* existsNoFollow: reject a symlink or reparse point named refs *)
-            if existsNoFollow (child gitDir "refs") then
-              StringMap.union (fun _ _ loose -> Some loose) packedRefs
-                (readLooseRefs gitDir "refs")
-            else
-              packedRefs in
-          Ready { Gitstate.head; refs = StringMap.bindings refs }
-      end
-    end
+    match Fs.confinedOpen worktree [".git"] with
+    | None -> Missing
+    | Some gitDir ->
+        withHandle gitDir (fun gitDir ->
+          if Fs.confinedKind gitDir <> Fs.ConfinedDirectory then
+            (* A regular .git is a gitfile/linked-worktree indirection.  We do
+             * not read it, because its workspace-controlled target could
+             * escape the designated replica. *)
+            Unsupported (".git exists but is not a directory: linked worktrees and \
+                          gitfile indirection are not supported")
+          else begin match isBusy gitDir with
+          | Some path -> Busy ("Git operation or lock is present: " ^ path)
+          | None ->
+              let head =
+                let headHandle = requireChild gitDir "HEAD" in
+                withHandle headHandle (fun handle ->
+                  match parseRefValue (readSmallFile "HEAD" handle) with
+                  | Some value -> Gitstate.Present value
+                  | None -> raise (Util.Transient "unsupported Git HEAD contents")) in
+              let packedRefs =
+                match withChild gitDir "packed-refs" (fun handle ->
+                  List.fold_left (fun refs (name, value) -> StringMap.add name value refs)
+                    StringMap.empty (parsePackedRefs (readSmallFile "packed-refs" handle))) with
+                | Some refs -> refs
+                | None -> StringMap.empty in
+              let refs =
+                match withChild gitDir "refs" (fun refs ->
+                  expectDirectory "refs" refs;
+                  StringMap.union (fun _ _ loose -> Some loose) packedRefs
+                    (readLooseRefs refs "refs")) with
+                | Some refs -> refs
+                | None -> packedRefs in
+              Ready { Gitstate.head; refs = StringMap.bindings refs }
+          end)
   with
   | Util.Transient message -> Unsupported message
   | Unix.Unix_error (error, operation, path) ->
       Unsupported (Printf.sprintf "%s failed for %s: %s" operation path
         (Unix.error_message error))
   | Sys_error message -> Unsupported message
+  | Failure message -> Unsupported message

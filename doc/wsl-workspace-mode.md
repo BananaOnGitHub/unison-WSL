@@ -59,29 +59,44 @@ The ordinary Unison archive, update detector, reconciler, transactional copy,
 and deletion-vs-modification behavior remain unchanged. Regular files are
 still compared and transferred byte-for-byte.
 
-### Remaining containment work
+### Git metadata confinement
 
-Rejecting reparse points during update detection closes the known static WSL
-symlink traversal path. The read-only Git inspection layer has also been
-hardened to eliminate all stat-following existence probes (`Fs.file_exists`),
-replacing them with fail-closed, lstat-based checks (`lstatNoFollow` and
-`existsNoFollow`) that immediately reject symbolic links and reparse points.
-Supported ref names are validated strictly against Git's `git-check-ref-format`
-rules (rejecting `..`, `@{`, control characters, spaces, wildcards `*`/`?`/`[`,
-backslashes, colons, carets, tildes, component `.lock` suffixes, and empty
-components), and repository busy states (`MERGE_HEAD`, `BISECT_HEAD`, `*.lock`,
-rebase/sequencer directories) are detected fail-closed.
+The read-only Git inspection layer no longer performs a path-based
+`lstat`-then-open sequence. On native Windows it opens the configured worktree
+with `NtCreateFile`, then opens `.git` and every Git metadata descendant
+relative to the already-opened parent directory handle. Each open uses
+`OBJ_DONT_REPARSE` and `FILE_OPEN_REPARSE_POINT`; the object actually opened is
+checked through that handle before it is consumed. If it is any reparse point,
+the implementation obtains its tag and rejects it—there is no allow-list for
+Windows symlinks, junctions, WSL `IO_REPARSE_TAG_LX_SYMLINK`, or unknown tags.
+`HEAD`, `packed-refs`, busy-state probes, directory enumeration, and loose-ref
+contents are all read from those already-open handles. A WSL process that
+replaces a checked name can therefore only leave the reader on the object it
+already opened or make a later open fail; it cannot redirect a metadata read
+outside the confined root.
 
-However, path-based `lstat` checks cannot prevent a time-of-check to
-time-of-use (TOCTOU) race where an adversarial WSL process replaces a validated
-file or directory with a symlink or reparse point before Unison opens it.
-Closing this race requires Windows handle-based confinement: opening paths via
-`NtCreateFile` with `FILE_OPEN_REPARSE_POINT`, verifying reparse tags on the
-opened handle, and performing all subsequent operations through that handle or
-handle-relative resolution without re-resolving pathnames.
-Until that handle-based confinement primitive is implemented and verified with
-native race testing in a subsequent security milestone, this mode remains
-strictly disabled for real workspace data. Use disposable fixtures only.
+Supported ref names remain validated strictly against Git's
+`git-check-ref-format` rules (rejecting `..`, `@{`, control characters, spaces,
+wildcards `*`/`?`/`[`, backslashes, colons, carets, tildes, component `.lock`
+suffixes, and empty components). Gitfiles and linked worktrees remain rejected
+without reading their indirection target. Repository busy states (`MERGE_HEAD`,
+`BISECT_HEAD`, `*.lock`, rebase/sequencer directories) are also inspected
+through confined handles and block Git handling fail-closed.
+
+This closes the documented Git-metadata pathname TOCTOU escape. It does not
+make a concurrent repository snapshot transactional: an already-open regular
+file can still be edited in place, and a directory may change while it is being
+enumerated. The reader rejects truncation or growth observed during a bounded
+file read, but same-length in-place rewrites and cross-file snapshot skew are
+reported only through the existing busy/conflict logic when that Git transaction
+layer is integrated. Native Windows builds also fail closed if the required NT
+handle APIs are unavailable. The primitive covers only the read-only Git
+inspector; ordinary workspace scanning still uses Unison's existing
+reparse-point protections and is outside this milestone.
+
+The foundation remains limited to disposable fixtures because Git object/ref
+propagation and the main transaction integration are not implemented yet. Do
+not point it at the real workspace.
 
 ## Git policy
 
@@ -167,6 +182,16 @@ Native Windows/WSL tests must use disposable roots and cover at least:
 8. executable and permission-bit changes;
 9. polling while Git and an editor perform atomic replacements; and
 10. archive/configuration placement outside both replicas.
+
+The current native self-test also constructs disposable Git metadata fixtures
+and verifies that a handle opened for `HEAD`, `packed-refs`, or a loose ref
+continues to read that original object after its pathname is atomically
+replaced. It separately replaces a retained `refs` directory name with a
+reparse point before a child open, and verifies that the child is still opened
+through the retained handle. Reparse-point versions of `HEAD`, `packed-refs`,
+and `refs` must all make inspection fail closed. The PowerShell fixture script
+runs that self-test across a disposable Windows root and a disposable
+`\\wsl.localhost\Ubuntu-26.04` root, in addition to its workspace smoke tests.
 
 Only after those pass should clean real replicas be established from a chosen
 source of truth and synchronized for the first time.

@@ -697,6 +697,158 @@ let test() =
         | _ -> Some "gitrepo inspect did not skip dotdot ref in packed-refs")
     | _ -> Some "gitrepo inspect dotdot-packed test requires a local root") ;
 
+  check_assert "gitrepo confined handles retain opened Git metadata" (fun () ->
+    let roots =
+      [r1; r2]
+      |> List.fold_left (fun roots root ->
+           match root with
+           | Common.Local, path -> path :: roots
+           | Common.Remote _, _ -> roots) [] in
+    let oid n = String.make 40 n in
+    let inspectRoot root suffix =
+      let repo = Fspath.concat root (Path.fromString ("git-confined-" ^ suffix)) in
+      let head = Fspath.concat repo (Path.fromString ".git/HEAD") in
+      let packed = Fspath.concat repo (Path.fromString ".git/packed-refs") in
+      let main = Fspath.concat repo (Path.fromString ".git/refs/heads/main") in
+      let contents = [
+        [".git"; "HEAD"], "ref: refs/heads/main\n", head;
+        [".git"; "packed-refs"], oid 'a' ^ " refs/heads/main\n", packed;
+        [".git"; "refs"; "heads"; "main"], oid 'b' ^ "\n", main
+      ] in
+      writefs repo (Dir [
+        ".git", Dir [
+          "HEAD", File "ref: refs/heads/main\n";
+          "packed-refs", File (oid 'a' ^ " refs/heads/main\n");
+          "refs", Dir ["heads", Dir ["main", File (oid 'b' ^ "\n")]]
+        ]
+      ]);
+      let readAlreadyOpened (components, expected, path) =
+        match Fs.confinedOpen repo components with
+        | None -> Error "confined open unexpectedly reported missing Git metadata"
+        | Some handle ->
+            let replacement =
+              Fspath.concat repo
+                (Path.fromString ("replacement-" ^ List.hd (List.rev components))) in
+            write replacement "ref: refs/heads/replaced\n";
+            Fs.rename replacement path;
+            try
+              let actual = Fs.confinedRead handle (1024 * 1024) in
+              Fs.confinedClose handle;
+              if actual = expected then Ok ()
+              else Error "confined Git metadata read reopened a replaced pathname"
+            with error ->
+              Fs.confinedClose handle;
+              raise error in
+      match List.find_opt (fun result -> result <> Ok ())
+              (List.map readAlreadyOpened contents) with
+      | None -> Ok ()
+      | Some (Error message) -> Error message
+      | Some (Ok ()) -> assert false in
+    match List.find_opt (fun result -> result <> Ok ())
+            (List.map (fun root -> inspectRoot root (Digest.to_hex
+              (Digest.string (Fspath.toString root)))) roots) with
+    | None -> None
+    | Some (Error message) -> Some message
+    | Some (Ok ()) -> assert false) ;
+
+  check_assert "gitrepo confined directory handles reject replacement reparse points" (fun () ->
+    if not Sys.win32 then None
+    else match List.find_opt (function
+      | Common.Local, root ->
+          Wslworkspace.classifyRoot (Fspath.toString root) = Wslworkspace.WindowsLocal
+      | Common.Remote _, _ -> false) [r1; r2] with
+    | Some (Common.Local, root) ->
+        let repo = Fspath.concat root (Path.fromString "git-confined-reparse") in
+        let outside = Fspath.concat root (Path.fromString "git-confined-outside") in
+        let refs = Fspath.concat repo (Path.fromString ".git/refs") in
+        writefs outside (Dir ["heads", Dir [
+          "main", File "ref: refs/heads/escaped\n"
+        ]]);
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "ref: refs/heads/main\n";
+            "refs", Dir ["heads", Dir [
+              "main", File "0123456789012345678901234567890123456789\n"
+            ]]
+          ]
+        ]);
+        begin match Fs.confinedOpen repo [".git"; "refs"] with
+        | None -> Some "confined open unexpectedly reported refs missing"
+        | Some refsHandle ->
+            (* The parent directory handle is already confined.  Replacing its
+               * name with a reparse point must not redirect the child open. *)
+            remove_file_or_dir refs;
+            Fs.symlink (Fspath.toString outside) refs;
+            begin try
+              let result =
+                match Fs.confinedOpenChild refsHandle "heads" with
+                | None -> Some "a retained directory handle lost its child"
+                | Some headsHandle ->
+                    let result =
+                      match Fs.confinedOpenChild headsHandle "main" with
+                      | None -> Some "a retained nested handle lost its ref"
+                      | Some mainHandle ->
+                          let contents = Fs.confinedRead mainHandle (1024 * 1024) in
+                          Fs.confinedClose mainHandle;
+                          if contents = "0123456789012345678901234567890123456789\n"
+                          then None
+                          else Some "a retained directory handle followed its replacement" in
+                    Fs.confinedClose headsHandle;
+                    result in
+              Fs.confinedClose refsHandle;
+              result
+            with error ->
+              Fs.confinedClose refsHandle;
+              raise error
+            end
+        end
+    | Some (Common.Remote _, _) | None ->
+        Some "confined reparse test requires a local root") ;
+
+  check_assert "gitrepo inspect rejects Git metadata reparse points" (fun () ->
+    if not Sys.win32 then None
+    else match List.find_opt (function
+      | Common.Local, root ->
+          Wslworkspace.classifyRoot (Fspath.toString root) = Wslworkspace.WindowsLocal
+      | Common.Remote _, _ -> false) [r1; r2] with
+    | Some (Common.Local, root) ->
+        let repo = Fspath.concat root (Path.fromString "git-reparse-rejection") in
+        let outside = Fspath.concat root (Path.fromString "git-reparse-target") in
+        let writeRepo () =
+          writefs repo (Dir [
+            ".git", Dir [
+              "HEAD", File "ref: refs/heads/main\n";
+              "packed-refs", File
+                "0123456789012345678901234567890123456789 refs/heads/main\n";
+              "refs", Dir ["heads", Dir []]
+            ]
+          ]) in
+        writefs outside (Dir [
+          "metadata", File "ref: refs/heads/escaped\n";
+          "refs", Dir ["heads", Dir []]
+        ]);
+        let cases = [
+          ".git/HEAD", "metadata", "HEAD";
+          ".git/packed-refs", "metadata", "packed-refs";
+          ".git/refs", "refs", "refs"
+        ] in
+        let rejected (relative, target, label) =
+          writeRepo ();
+          let path = Fspath.concat repo (Path.fromString relative) in
+          begin match Fs.lstat path with
+          | stat when stat.Unix.LargeFile.st_kind = Unix.S_DIR -> remove_file_or_dir path
+          | _ -> Fs.unlink path
+          end;
+          Fs.symlink
+            (Fspath.toString (Fspath.concat outside (Path.fromString target))) path;
+          match Gitrepo.inspect repo with
+          | Gitrepo.Unsupported _ -> true
+          | _ -> false in
+        if List.for_all rejected cases then None
+        else Some "gitrepo followed a reparse-point Git metadata path"
+    | Some (Common.Remote _, _) | None ->
+        Some "Git reparse rejection test requires a local root") ;
+
   (* N.b.: When making up tests, it's important to choose file contents of different
      lengths.  The reason for this is that, on some Unix systems, it is possible for
      the inode number of a just-deleted file to be reassigned to the very next file

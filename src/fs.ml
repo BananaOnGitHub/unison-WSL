@@ -19,6 +19,8 @@ type fspath = Fspath.t
 let mfspath = Fspath.m
 type dir_handle = System.dir_handle
                 = { readdir : unit -> string; closedir : unit -> unit }
+type confined_kind = System.confined_kind = ConfinedFile | ConfinedDirectory
+type confined_handle = System.confined_handle
 
 let path p = Fspath.toString p |> System.extendedPath
 
@@ -47,6 +49,13 @@ let stat f = System.stat (path f)
 let lstat f = System.lstat (path f)
 
 let isReparsePoint f = System.isReparsePoint (path f)
+
+let confinedOpen f components = System.confinedOpen (path f) components
+let confinedOpenChild = System.confinedOpenChild
+let confinedKind = System.confinedKind
+let confinedRead = System.confinedRead
+let confinedList = System.confinedList
+let confinedClose = System.confinedClose
 
 let openfile f flags perms = System.openfile (path f) flags perms
 

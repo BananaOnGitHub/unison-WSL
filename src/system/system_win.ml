@@ -59,6 +59,26 @@ let lstat f = stat_impl f true
 external is_reparse_point_impl : string -> bool = "win_is_reparse_point"
 let isReparsePoint = is_reparse_point_impl
 
+external confined_open_impl : string -> string list -> confined_handle option =
+  "win_confined_open"
+external confined_open_child_impl : confined_handle -> string -> confined_handle option =
+  "win_confined_open_child"
+external confined_kind_impl : confined_handle -> int = "win_confined_kind"
+external confined_read_impl : confined_handle -> int -> string = "win_confined_read"
+external confined_list_impl : confined_handle -> string list = "win_confined_list"
+external confined_close_impl : confined_handle -> unit = "win_confined_close"
+
+let confinedOpen = confined_open_impl
+let confinedOpenChild = confined_open_child_impl
+let confinedKind handle =
+  match confined_kind_impl handle with
+  | 0 -> ConfinedFile
+  | 1 -> ConfinedDirectory
+  | _ -> invalid_arg "invalid confined handle kind"
+let confinedRead = confined_read_impl
+let confinedList = confined_list_impl
+let confinedClose = confined_close_impl
+
 let rename f1 f2 =
   let rename_with_readonly_fix () =
     (* If the target exists and is a read-only file/symlink then the rename

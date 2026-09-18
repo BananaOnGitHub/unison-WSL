@@ -6,9 +6,12 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <limits.h>
 
 #include <caml/mlvalues.h>
 #include <caml/alloc.h>
+#include <caml/custom.h>
 #include <caml/memory.h>
 #include <caml/fail.h>
 #include <caml/unixsupport.h>
@@ -58,6 +61,24 @@ typedef struct _IO_STATUS_BLOCK {
   ULONG_PTR Information;
 } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
 
+/* These native definitions are intentionally local: older Windows SDKs used
+ * by supported OCaml/MSVC toolchains do not consistently expose the ntdll
+ * declarations required for handle-relative NtCreateFile calls. */
+typedef struct _UNISON_UNICODE_STRING {
+  USHORT Length;
+  USHORT MaximumLength;
+  PWSTR Buffer;
+} UNISON_UNICODE_STRING, *PUNISON_UNICODE_STRING;
+
+typedef struct _UNISON_OBJECT_ATTRIBUTES {
+  ULONG Length;
+  HANDLE RootDirectory;
+  PUNISON_UNICODE_STRING ObjectName;
+  ULONG Attributes;
+  PVOID SecurityDescriptor;
+  PVOID SecurityQualityOfService;
+} UNISON_OBJECT_ATTRIBUTES, *PUNISON_OBJECT_ATTRIBUTES;
+
 typedef struct _FILE_BASIC_INFORMATION {
   LARGE_INTEGER CreationTime;
   LARGE_INTEGER LastAccessTime;
@@ -102,6 +123,20 @@ typedef struct _FILE_NAME_INFORMATION {
   ULONG FileNameLength;
   WCHAR FileName[1];
 } FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
+typedef struct _FILE_DIRECTORY_INFORMATION {
+  ULONG NextEntryOffset;
+  ULONG FileIndex;
+  LARGE_INTEGER CreationTime;
+  LARGE_INTEGER LastAccessTime;
+  LARGE_INTEGER LastWriteTime;
+  LARGE_INTEGER ChangeTime;
+  LARGE_INTEGER EndOfFile;
+  LARGE_INTEGER AllocationSize;
+  ULONG FileAttributes;
+  ULONG FileNameLength;
+  WCHAR FileName[1];
+} FILE_DIRECTORY_INFORMATION, *PFILE_DIRECTORY_INFORMATION;
 
 typedef struct _FILE_ALL_INFORMATION {
   FILE_BASIC_INFORMATION     BasicInformation;
@@ -215,15 +250,100 @@ typedef NTSTATUS (NTAPI *sNtQueryInformationFile)
                   ULONG Length,
                   FILE_INFORMATION_CLASS FileInformationClass);
 
+typedef NTSTATUS (NTAPI *sNtCreateFile)
+                 (PHANDLE FileHandle,
+                  ACCESS_MASK DesiredAccess,
+                  PUNISON_OBJECT_ATTRIBUTES ObjectAttributes,
+                  PIO_STATUS_BLOCK IoStatusBlock,
+                  PLARGE_INTEGER AllocationSize,
+                  ULONG FileAttributes,
+                  ULONG ShareAccess,
+                  ULONG CreateDisposition,
+                  ULONG CreateOptions,
+                  PVOID EaBuffer,
+                  ULONG EaLength);
+
+typedef NTSTATUS (NTAPI *sNtQueryDirectoryFile)
+                 (HANDLE FileHandle,
+                  HANDLE Event,
+                  PVOID ApcRoutine,
+                  PVOID ApcContext,
+                  PIO_STATUS_BLOCK IoStatusBlock,
+                  PVOID FileInformation,
+                  ULONG Length,
+                  FILE_INFORMATION_CLASS FileInformationClass,
+                  BOOLEAN ReturnSingleEntry,
+                  PUNISON_UNICODE_STRING FileName,
+                  BOOLEAN RestartScan);
+
+typedef BOOLEAN (NTAPI *sRtlDosPathNameToNtPathNameU)
+                (PCWSTR DosName,
+                 PUNISON_UNICODE_STRING NtName,
+                 PCWSTR *FilePart,
+                 PVOID RelativeName);
+
+typedef VOID (NTAPI *sRtlFreeUnicodeString)
+             (PUNISON_UNICODE_STRING UnicodeString);
+
 typedef ULONG (NTAPI *sRtlNtStatusToDosError)
               (NTSTATUS Status);
 
 sNtQueryInformationFile pNtQueryInformationFile;
+sNtCreateFile pNtCreateFile;
+sNtQueryDirectoryFile pNtQueryDirectoryFile;
+sRtlDosPathNameToNtPathNameU pRtlDosPathNameToNtPathNameU;
+sRtlFreeUnicodeString pRtlFreeUnicodeString;
 
 sRtlNtStatusToDosError pRtlNtStatusToDosError;
 
 #ifndef NT_ERROR
 #define NT_ERROR(status) ((((ULONG) (status)) >> 30) == 3)
+#endif
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(status) ((NTSTATUS)(status) >= 0)
+#endif
+
+#ifndef OBJ_CASE_INSENSITIVE
+#define OBJ_CASE_INSENSITIVE 0x00000040L
+#endif
+
+/* OBJ_DONT_REPARSE is not present in older SDK headers.  On a Windows version
+ * that does not implement it, NtCreateFile fails and the caller fails closed. */
+#ifndef OBJ_DONT_REPARSE
+#define OBJ_DONT_REPARSE 0x00001000L
+#endif
+
+#ifndef FILE_OPEN
+#define FILE_OPEN 0x00000001UL
+#endif
+
+#ifndef FILE_DIRECTORY_FILE
+#define FILE_DIRECTORY_FILE 0x00000001UL
+#endif
+
+#ifndef FILE_SYNCHRONOUS_IO_NONALERT
+#define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020UL
+#endif
+
+#ifndef FILE_OPEN_REPARSE_POINT
+#define FILE_OPEN_REPARSE_POINT 0x00200000UL
+#endif
+
+#ifndef STATUS_NO_MORE_FILES
+#define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
+#endif
+
+#ifndef STATUS_OBJECT_NAME_NOT_FOUND
+#define STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034L)
+#endif
+
+#ifndef STATUS_OBJECT_PATH_NOT_FOUND
+#define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
+#endif
+
+#ifndef STATUS_NOT_A_DIRECTORY
+#define STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103L)
 #endif
 
 /* Linux symlinks exposed by WSL use a Microsoft reparse tag that is not the
@@ -237,6 +357,7 @@ sRtlNtStatusToDosError pRtlNtStatusToDosError;
 
 static int nt_init_done = 0;
 static int nt_api_available = 0;
+static int nt_confined_api_available = 0;
 
 /* BEGIN section originally copied from libuv win/winapi.c */
 
@@ -269,6 +390,17 @@ void win_init()
   }
 
   nt_api_available = 1;
+
+  pNtCreateFile = (sNtCreateFile) GetProcAddress(ntdll_module, "NtCreateFile");
+  pNtQueryDirectoryFile = (sNtQueryDirectoryFile) GetProcAddress(
+      ntdll_module, "NtQueryDirectoryFile");
+  pRtlDosPathNameToNtPathNameU = (sRtlDosPathNameToNtPathNameU) GetProcAddress(
+      ntdll_module, "RtlDosPathNameToNtPathName_U");
+  pRtlFreeUnicodeString = (sRtlFreeUnicodeString) GetProcAddress(
+      ntdll_module, "RtlFreeUnicodeString");
+  nt_confined_api_available =
+    pNtCreateFile != NULL && pNtQueryDirectoryFile != NULL &&
+    pRtlDosPathNameToNtPathNameU != NULL && pRtlFreeUnicodeString != NULL;
 }
 
 /* END section originally copied from libuv win/winapi.c */
@@ -302,6 +434,490 @@ CAMLprim value win_is_reparse_point(value path)
   }
 
   CAMLreturn((attributes & FILE_ATTRIBUTE_REPARSE_POINT) ? Val_true : Val_false);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Read-only confined handles                                                */
+
+/* Git metadata on a WSL UNC share is adversarial input.  These helpers never
+ * turn an already checked pathname back into a pathname open:
+ *
+ *   - the configured root is opened with NtCreateFile and OBJ_DONT_REPARSE;
+ *   - every descendant is opened relative to its already-open directory
+ *     handle, again with OBJ_DONT_REPARSE and FILE_OPEN_REPARSE_POINT;
+ *   - every opened handle is inspected before it can be read or enumerated.
+ *
+ * We reject every reparse tag rather than maintaining an allow-list.  The
+ * only supported objects are ordinary disk files and directories. */
+
+enum unison_confined_kind {
+  UNISON_CONFINED_FILE = 0,
+  UNISON_CONFINED_DIRECTORY = 1
+};
+
+typedef struct unison_confined_handle {
+  HANDLE handle;
+  int kind;
+} unison_confined_handle;
+
+static void unison_confined_finalize(value v)
+{
+  unison_confined_handle *confined =
+    (unison_confined_handle *) Data_custom_val(v);
+  if (confined->handle != INVALID_HANDLE_VALUE) {
+    (void) CloseHandle(confined->handle);
+    confined->handle = INVALID_HANDLE_VALUE;
+  }
+}
+
+static struct custom_operations unison_confined_handle_ops = {
+  "unison.confined_handle",
+  unison_confined_finalize,
+  custom_compare_default,
+  custom_hash_default,
+  custom_serialize_default,
+  custom_deserialize_default,
+  custom_compare_ext_default,
+  custom_fixed_length_default
+};
+
+static void unison_confined_close(unison_confined_handle *confined)
+{
+  if (confined->handle != INVALID_HANDLE_VALUE) {
+    (void) CloseHandle(confined->handle);
+    confined->handle = INVALID_HANDLE_VALUE;
+  }
+}
+
+static int unison_confined_component_valid(value name)
+{
+  mlsize_t length = caml_string_length(name);
+  mlsize_t i;
+  const char *bytes = String_val(name);
+
+  if (length == 0 ||
+      (length == 1 && bytes[0] == '.') ||
+      (length == 2 && bytes[0] == '.' && bytes[1] == '.')) {
+    return 0;
+  }
+  for (i = 0; i < length; i++) {
+    if (bytes[i] == '\0' || bytes[i] == '/' || bytes[i] == '\\' ||
+        bytes[i] == ':') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void unison_confined_validate_components(value components)
+{
+  value list = components;
+  while (Is_block(list)) {
+    value name = Field(list, 0);
+    if (!unison_confined_component_valid(name)) {
+      caml_invalid_argument("invalid confined path component");
+    }
+    list = Field(list, 1);
+  }
+  if (list != Val_emptylist) {
+    caml_invalid_argument("invalid confined path component list");
+  }
+}
+
+static int unison_confined_missing(NTSTATUS status)
+{
+  return status == STATUS_OBJECT_NAME_NOT_FOUND ||
+         status == STATUS_OBJECT_PATH_NOT_FOUND ||
+         status == STATUS_NOT_A_DIRECTORY;
+}
+
+static NTSTATUS unison_confined_nt_open(
+  HANDLE root,
+  PUNISON_UNICODE_STRING name,
+  ULONG create_options,
+  HANDLE *opened)
+{
+  UNISON_OBJECT_ATTRIBUTES attributes;
+  IO_STATUS_BLOCK io_status;
+
+  attributes.Length = sizeof attributes;
+  attributes.RootDirectory = root;
+  attributes.ObjectName = name;
+  attributes.Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE;
+  attributes.SecurityDescriptor = NULL;
+  attributes.SecurityQualityOfService = NULL;
+
+  return pNtCreateFile(
+    opened,
+    FILE_GENERIC_READ | SYNCHRONIZE,
+    &attributes,
+    &io_status,
+    NULL,
+    FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+    FILE_OPEN,
+    create_options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    NULL,
+    0);
+}
+
+static int unison_confined_validate_handle(HANDLE handle, int *kind, DWORD *error)
+{
+  BY_HANDLE_FILE_INFORMATION info;
+
+  if (!GetFileInformationByHandle(handle, &info)) {
+    *error = GetLastError();
+    return 0;
+  }
+
+  if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    char buffer[16384];
+    DWORD read = 0;
+    ULONG tag;
+
+    /* FILE_OPEN_REPARSE_POINT means this query examines the object we opened,
+     * rather than a target it might name.  A query failure is also unsafe. */
+    if (!DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT,
+                         NULL, 0, buffer, sizeof buffer, &read, NULL) ||
+        read < sizeof(ULONG)) {
+      *error = GetLastError();
+      if (*error == ERROR_SUCCESS) *error = ERROR_CANT_ACCESS_FILE;
+      return 0;
+    }
+
+    /* Deliberately inspect then reject every tag, including
+     * IO_REPARSE_TAG_LX_SYMLINK and future/unknown tags. */
+    tag = ((PREPARSE_DATA_BUFFER) buffer)->ReparseTag;
+    switch (tag) {
+      default:
+        *error = ERROR_CANT_ACCESS_FILE;
+        return 0;
+    }
+  }
+
+  if (GetFileType(handle) != FILE_TYPE_DISK) {
+    *error = ERROR_CANT_ACCESS_FILE;
+    return 0;
+  }
+
+  *kind = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ?
+    UNISON_CONFINED_DIRECTORY : UNISON_CONFINED_FILE;
+  return 1;
+}
+
+static void unison_confined_raise_nt(NTSTATUS status, const char *operation,
+                                     value path)
+{
+  DWORD error = pRtlNtStatusToDosError(status);
+  caml_win32_maperr(error);
+  caml_uerror(operation, path);
+}
+
+static void unison_confined_raise_win(DWORD error, const char *operation,
+                                      value path)
+{
+  caml_win32_maperr(error);
+  caml_uerror(operation, path);
+}
+
+/* Read/list receive an opaque custom block rather than an OCaml pathname.
+ * Raising a regular Failure here is intentional: callers turn it into a
+ * fail-closed unsupported-repository result, without treating the handle bits
+ * as a string path in caml_uerror. */
+static void unison_confined_fail_handle(const char *operation)
+{
+  caml_failwith(operation);
+}
+
+static value unison_confined_alloc(HANDLE handle, int kind)
+{
+  CAMLparam0();
+  CAMLlocal2(result, option);
+  unison_confined_handle *confined;
+
+  result = caml_alloc_custom(&unison_confined_handle_ops,
+                             sizeof(unison_confined_handle), 0, 1);
+  confined = (unison_confined_handle *) Data_custom_val(result);
+  confined->handle = handle;
+  confined->kind = kind;
+  option = caml_alloc(1, 0);
+  Store_field(option, 0, result);
+  CAMLreturn(option);
+}
+
+static int unison_confined_handle_from_value(value handle_value,
+                                             unison_confined_handle **handle)
+{
+  *handle = (unison_confined_handle *) Data_custom_val(handle_value);
+  return (*handle)->handle != INVALID_HANDLE_VALUE;
+}
+
+CAMLprim value win_confined_open(value root, value components)
+{
+  HANDLE current = INVALID_HANDLE_VALUE;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  UNISON_UNICODE_STRING root_name;
+  wchar_t *root_path;
+  value list;
+  int kind;
+  DWORD error;
+  CAMLparam2(root, components);
+
+  win_init();
+  if (!nt_confined_api_available) {
+    unison_confined_raise_win(ERROR_NOT_SUPPORTED, "confinedOpen", root);
+  }
+
+  /* Validate the complete list before obtaining any native handle. */
+  unison_confined_validate_components(components);
+
+  root_path = caml_stat_strdup_to_utf16(String_val(root));
+  if (!pRtlDosPathNameToNtPathNameU(root_path, &root_name, NULL, NULL)) {
+    caml_stat_free(root_path);
+    unison_confined_raise_win(ERROR_INVALID_NAME, "confinedOpen", root);
+  }
+  caml_stat_free(root_path);
+
+  status = unison_confined_nt_open(
+    NULL, &root_name, FILE_DIRECTORY_FILE, &current);
+  pRtlFreeUnicodeString(&root_name);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+    unison_confined_raise_nt(status, "confinedOpen", root);
+  }
+  if (!unison_confined_validate_handle(current, &kind, &error)) {
+    (void) CloseHandle(current);
+    unison_confined_raise_win(error, "confinedOpen", root);
+  }
+  if (kind != UNISON_CONFINED_DIRECTORY) {
+    (void) CloseHandle(current);
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpen", root);
+  }
+
+  list = components;
+  while (Is_block(list)) {
+    value name = Field(list, 0);
+    wchar_t *wide_name = caml_stat_strdup_to_utf16(String_val(name));
+    UNISON_UNICODE_STRING name_string;
+    mlsize_t name_length = caml_string_length(name);
+
+    name_string.Buffer = wide_name;
+    name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+    name_string.MaximumLength = name_string.Length;
+    /* The component was validated as non-empty and cannot contain NUL; this
+     * guards the UTF-16 conversion above against path truncation. */
+    if (name_length == 0 || name_string.Length == 0) {
+      caml_stat_free(wide_name);
+      (void) CloseHandle(current);
+      caml_invalid_argument("invalid confined path component");
+    }
+
+    status = unison_confined_nt_open(current, &name_string, 0, &child);
+    caml_stat_free(wide_name);
+    if (!NT_SUCCESS(status)) {
+      (void) CloseHandle(current);
+      if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+      unison_confined_raise_nt(status, "confinedOpen", name);
+    }
+    (void) CloseHandle(current);
+    current = child;
+    child = INVALID_HANDLE_VALUE;
+    if (!unison_confined_validate_handle(current, &kind, &error)) {
+      (void) CloseHandle(current);
+      unison_confined_raise_win(error, "confinedOpen", name);
+    }
+
+    list = Field(list, 1);
+    if (Is_block(list) && kind != UNISON_CONFINED_DIRECTORY) {
+      (void) CloseHandle(current);
+      unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpen", name);
+    }
+  }
+
+  CAMLreturn(unison_confined_alloc(current, kind));
+}
+
+CAMLprim value win_confined_open_child(value parent, value name)
+{
+  unison_confined_handle *parent_handle;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  wchar_t *wide_name;
+  UNISON_UNICODE_STRING name_string;
+  int kind;
+  DWORD error;
+  CAMLparam2(parent, name);
+
+  if (!unison_confined_handle_from_value(parent, &parent_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (parent_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpenChild", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_nt_open(parent_handle->handle, &name_string, 0, &child);
+  caml_stat_free(wide_name);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+    unison_confined_raise_nt(status, "confinedOpenChild", name);
+  }
+  if (!unison_confined_validate_handle(child, &kind, &error)) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(error, "confinedOpenChild", name);
+  }
+
+  CAMLreturn(unison_confined_alloc(child, kind));
+}
+
+CAMLprim value win_confined_kind(value handle_value)
+{
+  unison_confined_handle *handle;
+  CAMLparam1(handle_value);
+
+  if (!unison_confined_handle_from_value(handle_value, &handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  CAMLreturn(Val_int(handle->kind));
+}
+
+CAMLprim value win_confined_read(value handle_value, value maximum_value)
+{
+  unison_confined_handle *handle;
+  LARGE_INTEGER size;
+  DWORD read;
+  int maximum;
+  int offset = 0;
+  value contents;
+  CAMLparam2(handle_value, maximum_value);
+  CAMLlocal1(contents);
+
+  if (!unison_confined_handle_from_value(handle_value, &handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (handle->kind != UNISON_CONFINED_FILE) {
+    unison_confined_fail_handle("confinedRead on a directory handle");
+  }
+  maximum = Int_val(maximum_value);
+  if (maximum < 0) caml_invalid_argument("negative confined read limit");
+  if (!GetFileSizeEx(handle->handle, &size))
+    unison_confined_fail_handle("confinedRead could not establish a file size");
+  if (size.QuadPart < 0 || size.QuadPart > maximum ||
+      size.QuadPart > INT_MAX)
+    unison_confined_fail_handle("confinedRead rejected an oversized file");
+
+  contents = caml_alloc_string((mlsize_t) size.QuadPart);
+  while (offset < size.QuadPart) {
+    DWORD requested = (DWORD) min((LONGLONG) 1 << 20, size.QuadPart - offset);
+    if (!ReadFile(handle->handle, String_val(contents) + offset,
+                  requested, &read, NULL) || read == 0) {
+      unison_confined_fail_handle("confinedRead observed a truncated file");
+    }
+    offset += (int) read;
+  }
+  /* A handle opened from a file that grew while it was read is not a stable
+   * metadata snapshot.  Do not silently consume a prefix. */
+  {
+    char extra;
+    if (!ReadFile(handle->handle, &extra, 1, &read, NULL)) {
+      unison_confined_fail_handle("confinedRead could not verify end of file");
+    }
+    if (read != 0) {
+      unison_confined_fail_handle("confinedRead observed a file replacement or growth");
+    }
+  }
+  CAMLreturn(contents);
+}
+
+CAMLprim value win_confined_list(value handle_value)
+{
+  unison_confined_handle *handle;
+  char buffer[65536];
+  IO_STATUS_BLOCK io_status;
+  NTSTATUS status;
+  int restart = 1;
+  CAMLparam1(handle_value);
+  CAMLlocal3(result, entry, name);
+
+  result = Val_emptylist;
+
+  if (!unison_confined_handle_from_value(handle_value, &handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_fail_handle("confinedList on a file handle");
+  }
+
+  for (;;) {
+    ULONG offset = 0;
+    ULONG available;
+    status = pNtQueryDirectoryFile(
+      handle->handle, NULL, NULL, NULL, &io_status, buffer, sizeof buffer,
+      FileDirectoryInformation, FALSE, NULL, restart ? TRUE : FALSE);
+    restart = 0;
+    if (status == STATUS_NO_MORE_FILES) break;
+    if (!NT_SUCCESS(status)) {
+      unison_confined_fail_handle("confinedList could not enumerate a directory");
+    }
+    if (io_status.Information > sizeof buffer) {
+      unison_confined_fail_handle("confinedList received invalid directory data");
+    }
+    available = (ULONG) io_status.Information;
+    if (available < offsetof(FILE_DIRECTORY_INFORMATION, FileName)) {
+      unison_confined_fail_handle("confinedList received invalid directory data");
+    }
+
+    for (;;) {
+      PFILE_DIRECTORY_INFORMATION info;
+      WCHAR *wide_name;
+      ULONG wide_length;
+
+      if (offset > available - offsetof(FILE_DIRECTORY_INFORMATION, FileName)) {
+        unison_confined_fail_handle("confinedList received invalid directory data");
+      }
+      info = (PFILE_DIRECTORY_INFORMATION) (buffer + offset);
+      if (info->FileNameLength > available - offset -
+          offsetof(FILE_DIRECTORY_INFORMATION, FileName) ||
+          info->FileNameLength % sizeof(WCHAR) != 0) {
+        unison_confined_fail_handle("confinedList received invalid directory data");
+      }
+      wide_length = info->FileNameLength / sizeof(WCHAR);
+      wide_name = caml_stat_alloc((wide_length + 1) * sizeof(WCHAR));
+      memcpy(wide_name, info->FileName, info->FileNameLength);
+      wide_name[wide_length] = L'\0';
+      name = caml_copy_string_of_utf16(wide_name);
+      caml_stat_free(wide_name);
+      entry = caml_alloc(2, 0);
+      Store_field(entry, 0, name);
+      Store_field(entry, 1, result);
+      result = entry;
+
+      if (info->NextEntryOffset == 0) break;
+      if (info->NextEntryOffset > available - offset) {
+        unison_confined_fail_handle("confinedList received invalid directory data");
+      }
+      offset += info->NextEntryOffset;
+    }
+  }
+
+  CAMLreturn(result);
+}
+
+CAMLprim value win_confined_close(value handle_value)
+{
+  unison_confined_handle *handle;
+  CAMLparam1(handle_value);
+
+  handle = (unison_confined_handle *) Data_custom_val(handle_value);
+  unison_confined_close(handle);
+  CAMLreturn(Val_unit);
 }
 
 #define MAKEDWORDLONG(a,b) ((DWORDLONG)(((DWORD)(a))|(((DWORDLONG)((DWORD)(b)))<<32)))
