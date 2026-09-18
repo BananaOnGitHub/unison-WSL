@@ -389,6 +389,95 @@ let test() =
     then None
     else Some "WSL workspace configuration containment failed") ;
 
+  check_assert "wslworkspace Git ref reconciliation" (fun () ->
+    let present value = Gitstate.Present value in
+    let absent = Gitstate.Absent in
+    let unilateral = Gitstate.reconcileValue
+      ~base:(present "a") ~left:(present "b") ~right:(present "a") in
+    let divergent = Gitstate.reconcileValue
+      ~base:(present "a") ~left:(present "b") ~right:(present "c") in
+    let deleteVsModify = Gitstate.reconcileValue
+      ~base:(present "a") ~left:absent ~right:(present "b") in
+    let creation = Gitstate.reconcileValue
+      ~base:absent ~left:(present "a") ~right:absent in
+    match unilateral, divergent, deleteVsModify, creation with
+    | Gitstate.CopyLeftToRight (Gitstate.Present "b"),
+      Gitstate.Conflict,
+      Gitstate.Conflict,
+      Gitstate.CopyLeftToRight (Gitstate.Present "a") -> None
+    | _ -> Some "WSL workspace Git refs did not preserve three-way conflicts") ;
+
+  check_assert "wslworkspace Git repository initialization" (fun () ->
+    let snapshot = {
+      Gitstate.head = Gitstate.Present "ref: refs/heads/main\n";
+      refs = ["refs/heads/main", "0123456789012345678901234567890123456789"]
+    } in
+    match Gitstate.reconcileRepository
+      ~base:Gitstate.Missing ~left:(Gitstate.Repository snapshot)
+      ~right:Gitstate.Missing with
+    | Gitstate.InitializeRightFromLeft -> None
+    | _ -> Some "WSL workspace Git initialization was not directional") ;
+
+  check_assert "wslworkspace Git metadata parsing" (fun () ->
+    let oid = "0123456789012345678901234567890123456789" in
+    let head = Gitrepo.parseRefValue "ref: refs/heads/main\n" in
+    let refs = Gitrepo.parsePackedRefs
+      ("# pack-refs with: peeled fully-peeled\n" ^ oid ^ " refs/heads/main\n"
+       ^ "^ffffffffffffffffffffffffffffffffffffffff\n"
+       ^ oid ^ " refs/remotes/origin/main\n") in
+    if head = Some "ref: refs/heads/main" && refs = ["refs/heads/main", oid]
+    then None
+    else Some "WSL workspace Git metadata parsing accepted unsafe refs") ;
+
+  check_assert "wslworkspace Git repository inspection" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let repo = Fspath.concat root (Path.fromString "git-inspection") in
+        if not (Fs.file_exists root) then Fs.mkdir root default_perm;
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "ref: refs/heads/main\n";
+            "packed-refs", File
+              "0123456789012345678901234567890123456789 refs/heads/main\n";
+            "refs", Dir [
+              "heads", Dir [
+                "main", File "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+              ]
+            ]
+          ]
+        ]);
+        begin match Gitrepo.inspect repo with
+        | Gitrepo.Ready snapshot
+          when snapshot.Gitstate.head = Gitstate.Present "ref: refs/heads/main"
+               && snapshot.refs = [
+                 "refs/heads/main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+               ] ->
+            write (Fspath.concat repo (Path.fromString ".git/index.lock")) "busy\n";
+            begin match Gitrepo.inspect repo with
+            | Gitrepo.Busy _ -> None
+            | _ -> Some "WSL workspace Git inspection ignored an active lock"
+            end
+        | _ -> Some "WSL workspace Git inspection did not prefer loose refs"
+        end
+    | Common.Remote _, _ ->
+        Some "WSL workspace Git inspection self-test requires a local root") ;
+
+  check_assert "wslworkspace Git archive containment" (fun () ->
+    match r2 with
+    | Common.Local, root ->
+        if not (Fs.file_exists root) then Fs.mkdir root default_perm;
+        let directory = Fspath.concat root (Path.fromString "git-archive-test") in
+        let snapshot = {
+          Gitstate.head = Gitstate.Present "ref: refs/heads/main";
+          refs = ["refs/heads/main", "0123456789012345678901234567890123456789"]
+        } in
+        let key = Gitarchive.keyForRoots ["C:/workspace"; "//wsl.localhost/Distro/workspace"] in
+        Gitarchive.save ~directory ~key ["project", snapshot];
+        if Gitarchive.load ~directory ~key = ["project", snapshot] then None
+        else Some "WSL workspace Git archive was not persisted outside the repository"
+    | Common.Remote _, _ ->
+        Some "WSL workspace Git archive self-test requires a local root") ;
+
   (* N.b.: When making up tests, it's important to choose file contents of different
      lengths.  The reason for this is that, on some Unix systems, it is possible for
      the inode number of a just-deleted file to be reassigned to the very next file

@@ -70,19 +70,37 @@ native race test. Until then, use disposable fixtures only.
 
 ## Git policy
 
-`.git` is replica-local state. Indices, reflogs, lockfiles, `ORIG_HEAD`, object
-databases, hooks, and local configuration never cross the boundary.
+Git repositories are one logical repository across the two workspace replicas.
+The mode will reconcile Git's durable shared state separately from the ordinary
+filesystem tree; it will not turn `.git` into an ordinary Unison subtree.
+
+The durable shared set is Git object data, `HEAD`, and supported refs. Objects
+are content-addressed and can be copied by union. `HEAD` and every ref use a
+separate Windows-side, three-way Git-state archive: a change on only one side
+propagates; two different changes, including deletion-versus-modification,
+are reported as a Git conflict and neither side wins. Repository creation on
+one side initializes the other from this durable set. Packed refs are handled
+as refs, not copied as an opaque file.
+
+Indexes, reflogs, locks, operation state, hooks, and local configuration are
+platform-local. An active rebase, merge, cherry-pick, lockfile, or comparable
+operation blocks synchronization of that repository's working tree and Git
+state until it becomes quiescent. The synchronizer does not create conflict
+branches, refs, or project-visible bookkeeping files.
+
+The current foundation still hard-ignores `.git` while this Git transaction
+layer is being wired into the Windows-only runtime. It is therefore not yet a
+Git-capable release and remains limited to disposable fixtures.
 
 The working tree is not normalized by Unison. In particular, Unison will not
 pretend LF and CRLF byte sequences are equal. Doing so would make the archive
 describe something other than the bytes on disk and would weaken later change
-and conflict detection. The mode also does not invoke Git to compare files;
-Git attributes and filters can lead to configured external commands.
+and conflict detection. The Git reconciler also does not execute Git or consult
+workspace-controlled Git configuration; attributes and filters can invoke
+external commands.
 
-Each Git repository therefore needs an independent `.git` directory on both
-sides and a checkout policy that materializes the same bytes. For a repository
-that should use LF on both platforms, set the Windows repository's local
-configuration (not the user's global configuration):
+For a repository that should use LF on both platforms, set the Windows
+repository's local checkout policy (not the user's global configuration):
 
 ```powershell
 git -C C:\path\to\repo config --local core.autocrlf false
@@ -92,12 +110,25 @@ git -C C:\path\to\repo config --local core.eol lf
 A committed `.gitattributes` policy is preferable when the project owns one.
 Neither choice changes arbitrary non-Git files.
 
-If a repository is cloned or initialized on only one replica, its ordinary
-working files can synchronize, but its ignored `.git` directory cannot. The
-other replica remains a plain directory until it is independently cloned or
-initialized. Automatic repository creation and parity reporting are deferred
-until they can be implemented without executing workspace-controlled Git
-configuration.
+Git state, synchronizer archives, logs, and conflict records remain in the
+trusted Windows-side state directory outside both workspaces. Nothing under
+either workspace is used as synchronizer control state.
+
+This is the target transaction boundary. The branch currently contains the
+Git ref reconciler, safe read-only repository inspection, and trusted-state
+archive; propagation is not wired into a synchronization run yet.
+
+| Category | Treatment |
+| --- | --- |
+| Ordinary working files | Existing Unison archive/reconciliation; byte-exact |
+| Git objects | Safe union/copy after a quiescence check; never blindly deleted |
+| `HEAD` and durable refs | Windows-side three-way Git-state archive; conflicts fail closed |
+| Index, reflogs, hooks, config, locks, operation scratch | Replica-local; never propagated as shared state |
+| Synchronizer state and diagnostics | Trusted Windows-side state directory only |
+
+For the dedicated deployment, set `UNISON` to a Windows-only location such as
+`$env:LOCALAPPDATA\Unison-WSL`. The mode rejects it if it resolves inside a
+replica or through a reparse point.
 
 ## Validation plan
 

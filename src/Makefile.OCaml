@@ -65,12 +65,13 @@ OCAMLOBJS = \
           ubase/util.cmo ubase/uarg.cmo \
           ubase/prefs.cmo ubase/trace.cmo ubase/proplist.cmo \
           wslworkspace.cmo \
+          gitstate.cmo \
           \
           lwt/pqueue.cmo lwt/lwt.cmo lwt/lwt_util.cmo \
           lwt/$(SYSTEM)/lwt_unix_impl.cmo lwt/lwt_unix.cmo \
           \
           features.cmo uutil.cmo case.cmo pred.cmo terminal.cmo \
-          fileutil.cmo name.cmo path.cmo fspath.cmo fs.cmo fingerprint.cmo \
+          fileutil.cmo name.cmo path.cmo fspath.cmo fs.cmo gitrepo.cmo gitarchive.cmo fingerprint.cmo \
           abort.cmo osx.cmo fswatch.cmo propsdata.cmo \
           props.cmo fileinfo.cmo os.cmo lock.cmo clroot.cmo common.cmo \
           tree.cmo checksum.cmo transfer.cmo xferhint.cmo \

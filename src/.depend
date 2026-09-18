@@ -503,6 +503,45 @@ fswatchold.cmi : \
     path.cmi \
     lwt/lwt.cmi \
     fspath.cmi
+gitarchive.cmo : \
+    ubase/util.cmi \
+    name.cmi \
+    gitstate.cmi \
+    fspath.cmi \
+    fs.cmi \
+    gitarchive.cmi
+gitarchive.cmx : \
+    ubase/util.cmx \
+    name.cmx \
+    gitstate.cmx \
+    fspath.cmx \
+    fs.cmx \
+    gitarchive.cmi
+gitarchive.cmi : \
+    gitstate.cmi \
+    fspath.cmi
+gitrepo.cmo : \
+    ubase/util.cmi \
+    name.cmi \
+    gitstate.cmi \
+    fspath.cmi \
+    fs.cmi \
+    gitrepo.cmi
+gitrepo.cmx : \
+    ubase/util.cmx \
+    name.cmx \
+    gitstate.cmx \
+    fspath.cmx \
+    fs.cmx \
+    gitrepo.cmi
+gitrepo.cmi : \
+    gitstate.cmi \
+    fspath.cmi
+gitstate.cmo : \
+    gitstate.cmi
+gitstate.cmx : \
+    gitstate.cmi
+gitstate.cmi :
 globals.cmo : \
     wslworkspace.cmi \
     ubase/util.cmi \
@@ -1101,6 +1140,9 @@ test.cmo : \
     lwt/lwt_unix.cmi \
     lwt/lwt.cmi \
     globals.cmi \
+    gitstate.cmi \
+    gitrepo.cmi \
+    gitarchive.cmi \
     fspath.cmi \
     fs.cmi \
     common.cmi \
@@ -1125,6 +1167,9 @@ test.cmx : \
     lwt/lwt_unix.cmx \
     lwt/lwt.cmx \
     globals.cmx \
+    gitstate.cmx \
+    gitrepo.cmx \
+    gitarchive.cmx \
     fspath.cmx \
     fs.cmx \
     common.cmx \
