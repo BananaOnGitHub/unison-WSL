@@ -520,6 +520,20 @@ gitarchive.cmx : \
 gitarchive.cmi : \
     gitstate.cmi \
     fspath.cmi
+gitindex.cmo : \
+    ubase/util.cmi \
+    name.cmi \
+    fspath.cmi \
+    fs.cmi \
+    gitindex.cmi
+gitindex.cmx : \
+    ubase/util.cmx \
+    name.cmx \
+    fspath.cmx \
+    fs.cmx \
+    gitindex.cmi
+gitindex.cmi : \
+    fspath.cmi
 gitrepo.cmo : \
     ubase/util.cmi \
     name.cmi \

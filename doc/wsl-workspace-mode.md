@@ -88,6 +88,14 @@ operation blocks synchronization of that repository's working tree and Git
 state until it becomes quiescent. The synchronizer does not create conflict
 branches, refs, or project-visible bookkeeping files.
 
+After a shared `HEAD` move, the destination index must be rebuilt or Git will
+falsely report a clean working tree as staged/unstaged changes. That rebuild
+uses a trusted Windows Git executable configured outside the workspace. It is
+run against an isolated helper Git directory under the Windows-side state
+directory, with the replica's synchronized object store supplied only as an
+alternate object database. It does not load the workspace repository's config,
+hooks, filters, attributes, or work tree.
+
 The current foundation still hard-ignores `.git` while this Git transaction
 layer is being wired into the Windows-only runtime. It is therefore not yet a
 Git-capable release and remains limited to disposable fixtures.
