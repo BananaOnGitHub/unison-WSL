@@ -62,11 +62,26 @@ still compared and transferred byte-for-byte.
 ### Remaining containment work
 
 Rejecting reparse points during update detection closes the known static WSL
-symlink traversal path. A hostile process can still attempt a time-of-check to
-time-of-use swap between inspection and a later file open. Before this mode is
-approved for the real autonomous-agent workspace, Windows file opens need
-handle-based confinement (or an equivalently strong mechanism), followed by a
-native race test. Until then, use disposable fixtures only.
+symlink traversal path. The read-only Git inspection layer has also been
+hardened to eliminate all stat-following existence probes (`Fs.file_exists`),
+replacing them with fail-closed, lstat-based checks (`lstatNoFollow` and
+`existsNoFollow`) that immediately reject symbolic links and reparse points.
+Supported ref names are validated strictly against Git's `git-check-ref-format`
+rules (rejecting `..`, `@{`, control characters, spaces, wildcards `*`/`?`/`[`,
+backslashes, colons, carets, tildes, component `.lock` suffixes, and empty
+components), and repository busy states (`MERGE_HEAD`, `BISECT_HEAD`, `*.lock`,
+rebase/sequencer directories) are detected fail-closed.
+
+However, path-based `lstat` checks cannot prevent a time-of-check to
+time-of-use (TOCTOU) race where an adversarial WSL process replaces a validated
+file or directory with a symlink or reparse point before Unison opens it.
+Closing this race requires Windows handle-based confinement: opening paths via
+`NtCreateFile` with `FILE_OPEN_REPARSE_POINT`, verifying reparse tags on the
+opened handle, and performing all subsequent operations through that handle or
+handle-relative resolution without re-resolving pathnames.
+Until that handle-based confinement primitive is implemented and verified with
+native race testing in a subsequent security milestone, this mode remains
+strictly disabled for real workspace data. Use disposable fixtures only.
 
 ## Git policy
 

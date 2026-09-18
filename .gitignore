@@ -11,6 +11,7 @@
 *.log
 *.mode1v3
 *.o
+*.obj
 *.pbxuser
 *.pyc
 *.pyo

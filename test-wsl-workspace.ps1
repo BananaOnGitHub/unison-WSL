@@ -43,7 +43,14 @@ function Invoke-WorkspaceSync {
         '-batch',
         '-confirmbigdel=false'
     )
-    $output = (& $UnisonExe @arguments 2>&1 | Out-String)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = (& $UnisonExe @arguments 2>&1 | Out-String)
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
     $exitCode = $LASTEXITCODE
     if (-not $AllowFailure -and $exitCode -ne 0) {
         throw "Unison failed with exit code $exitCode`n$output"

@@ -478,6 +478,225 @@ let test() =
     | Common.Remote _, _ ->
         Some "WSL workspace Git archive self-test requires a local root") ;
 
+  (* ---------------------------------------------------------------------- *)
+  (* Focused tests for the hardened Git inspection layer.
+     All fixtures are disposable and created under the existing test roots.
+     No real Agent Stuff workspace or external Git process is used. *)
+
+  check_assert "gitrepo isObjectId" (fun () ->
+    let valid40 = "0123456789abcdefABCDEF0123456789abcdef01" in
+    let valid64 = String.make 64 'a' in
+    let short   = "0123456789abcdef" in
+    let long    = String.make 41 'a' in
+    let nonhex  = "g123456789abcdef0123456789abcdef01234567" in
+    if Gitrepo.isObjectId valid40
+    && Gitrepo.isObjectId valid64
+    && not (Gitrepo.isObjectId short)
+    && not (Gitrepo.isObjectId long)
+    && not (Gitrepo.isObjectId nonhex)
+    && not (Gitrepo.isObjectId "")
+    then None
+    else Some "gitrepo isObjectId did not accept/reject correctly") ;
+
+  check_assert "gitrepo isSupportedRefName -- valid" (fun () ->
+    let valid = [
+      "refs/heads/main";
+      "refs/heads/feature/foo";
+      "refs/tags/v1.0.0";
+      "refs/heads/1234";
+    ] in
+    if List.for_all Gitrepo.isSupportedRefName valid then None
+    else Some "gitrepo isSupportedRefName rejected a valid ref") ;
+
+  check_assert "gitrepo isSupportedRefName -- invalid" (fun () ->
+    let invalid = [
+      "HEAD";
+      "refs";
+      "refs/remotes/origin/main";
+      "refs/bisect/good";
+      "refs/stash";
+      "refs/worktree/main";
+      "refs/original/refs/heads/main";
+      "refs/rewritten/main";
+      "refs/heads/my..branch";
+      "refs/heads/foo@{bar}";
+      "refs/heads/foo.lock";
+      "refs/heads/foo bar";
+      "refs/heads/foo*";
+      "refs/heads/foo?";
+      "refs/heads/[foo]";
+      "refs/heads/foo\\bar";
+      "refs/heads/";
+      "refs/heads/.hidden";
+      "refs/heads/trailing.";
+      "refs/heads/foo^bar";
+      "refs/heads/foo~1";
+      "refs/heads/foo:bar";
+      "refs/heads//main";
+    ] in
+    if List.for_all (fun n -> not (Gitrepo.isSupportedRefName n)) invalid then None
+    else Some "gitrepo isSupportedRefName accepted a forbidden ref name") ;
+
+  check_assert "gitrepo parsePackedRefs -- malicious entries skipped" (fun () ->
+    let oid = "0123456789012345678901234567890123456789" in
+    let contents =
+      "# pack-refs with: peeled\n"
+      ^ oid ^ " refs/heads/main\n"
+      ^ oid ^ " refs/remotes/origin/main\n"
+      ^ oid ^ " refs/heads/my..branch\n"
+      ^ oid ^ " refs/heads/foo bar\n"
+      ^ "notanoid refs/heads/other\n"
+      ^ "^" ^ oid ^ "\n"
+    in
+    let refs = Gitrepo.parsePackedRefs contents in
+    if refs = ["refs/heads/main", oid]
+    then None
+    else Some "gitrepo parsePackedRefs did not skip malicious entries") ;
+
+  check_assert "gitrepo parseRefValue" (fun () ->
+    let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+    let cases = [
+      (oid ^ "\n",                                    Some oid);
+      ("ref: refs/heads/main\n",                      Some "ref: refs/heads/main");
+      ("ref: refs/remotes/origin/main\n",             None);
+      ("ref: refs/heads/../../etc/passwd\n",          None);
+      ("not a ref\n",                                 None);
+      ("",                                            None);
+    ] in
+    if List.for_all (fun (input, expected) ->
+         Gitrepo.parseRefValue input = expected) cases
+    then None
+    else Some "gitrepo parseRefValue did not parse correctly") ;
+
+  check_assert "gitrepo inspect -- missing .git" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let repo = Fspath.concat root (Path.fromString "git-missing") in
+        remove_file_or_dir repo;
+        Fs.mkdir repo default_perm;
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Missing -> None
+        | _ -> Some "gitrepo inspect should return Missing when .git absent")
+    | _ -> Some "gitrepo inspect missing-test requires a local root") ;
+
+  check_assert "gitrepo inspect -- detached HEAD" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let oid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in
+        let repo = Fspath.concat root (Path.fromString "git-detached") in
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File (oid ^ "\n");
+            "refs", Dir ["heads", Dir []]
+          ]
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Ready snap
+          when snap.Gitstate.head = Gitstate.Present oid
+               && snap.refs = [] -> None
+        | _ -> Some "gitrepo inspect did not handle detached HEAD correctly")
+    | _ -> Some "gitrepo inspect detached-HEAD test requires a local root") ;
+
+  check_assert "gitrepo inspect -- MERGE_HEAD busy" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let repo = Fspath.concat root (Path.fromString "git-merge-busy") in
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "ref: refs/heads/main\n";
+            "MERGE_HEAD", File "cccccccccccccccccccccccccccccccccccccccc\n";
+            "refs", Dir ["heads", Dir [
+              "main", File "dddddddddddddddddddddddddddddddddddddddd\n"
+            ]]
+          ]
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Busy _ -> None
+        | _ -> Some "gitrepo inspect did not detect MERGE_HEAD as busy")
+    | _ -> Some "gitrepo inspect busy-test requires a local root") ;
+
+  check_assert "gitrepo inspect -- BISECT_HEAD busy" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let repo = Fspath.concat root (Path.fromString "git-bisect-busy") in
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "ref: refs/heads/main\n";
+            "BISECT_HEAD", File "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n";
+            "refs", Dir ["heads", Dir [
+              "main", File "ffffffffffffffffffffffffffffffffffffffff\n"
+            ]]
+          ]
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Busy _ -> None
+        | _ -> Some "gitrepo inspect did not detect BISECT_HEAD as busy")
+    | _ -> Some "gitrepo inspect bisect-busy test requires a local root") ;
+
+  check_assert "gitrepo inspect -- gitfile (.git is a regular file)" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let repo = Fspath.concat root (Path.fromString "git-gitfile") in
+        writefs repo (Dir [
+          ".git", File "gitdir: ../.git/worktrees/linked\n"
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Unsupported _ -> None
+        | _ -> Some "gitrepo inspect should reject a gitfile .git")
+    | _ -> Some "gitrepo inspect gitfile test requires a local root") ;
+
+  check_assert "gitrepo inspect -- packed-refs only (no refs dir)" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let oid = "1111111111111111111111111111111111111111" in
+        let repo = Fspath.concat root (Path.fromString "git-packed-only") in
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "ref: refs/heads/main\n";
+            "packed-refs", File (oid ^ " refs/heads/main\n")
+          ]
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Ready snap
+          when snap.Gitstate.head = Gitstate.Present "ref: refs/heads/main"
+               && snap.refs = ["refs/heads/main", oid] -> None
+        | _ -> Some "gitrepo inspect failed to read packed-refs without refs dir")
+    | _ -> Some "gitrepo inspect packed-refs-only test requires a local root") ;
+
+  check_assert "gitrepo inspect -- bad HEAD contents" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let repo = Fspath.concat root (Path.fromString "git-bad-head") in
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "not a valid ref or oid\n";
+            "refs", Dir ["heads", Dir []]
+          ]
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Unsupported _ -> None
+        | _ -> Some "gitrepo inspect should reject a malformed HEAD")
+    | _ -> Some "gitrepo inspect bad-HEAD test requires a local root") ;
+
+  check_assert "gitrepo inspect -- dotdot ref in packed-refs skipped" (fun () ->
+    match r1 with
+    | Common.Local, root ->
+        let oid = "2222222222222222222222222222222222222222" in
+        let repo = Fspath.concat root (Path.fromString "git-dotdot-packed") in
+        writefs repo (Dir [
+          ".git", Dir [
+            "HEAD", File "ref: refs/heads/main\n";
+            "packed-refs", File
+              (oid ^ " refs/heads/../../etc/passwd\n"
+               ^ oid ^ " refs/heads/main\n")
+          ]
+        ]);
+        (match Gitrepo.inspect repo with
+        | Gitrepo.Ready snap
+          when snap.refs = ["refs/heads/main", oid] -> None
+        | _ -> Some "gitrepo inspect did not skip dotdot ref in packed-refs")
+    | _ -> Some "gitrepo inspect dotdot-packed test requires a local root") ;
+
   (* N.b.: When making up tests, it's important to choose file contents of different
      lengths.  The reason for this is that, on some Unix systems, it is possible for
      the inode number of a just-deleted file to be reassigned to the very next file

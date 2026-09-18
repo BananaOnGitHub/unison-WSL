@@ -7,6 +7,9 @@ type inspection =
   | Busy of string
   | Unsupported of string
 
+(* Exported for testing and policy checks. *)
+val isObjectId : string -> bool
+val isSupportedRefName : string -> bool
 val parseRefValue : string -> string option
 val parsePackedRefs : string -> (string * string) list
 val inspect : Fspath.t -> inspection
