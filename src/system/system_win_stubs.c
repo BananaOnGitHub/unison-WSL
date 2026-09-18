@@ -226,6 +226,13 @@ sRtlNtStatusToDosError pRtlNtStatusToDosError;
 #define NT_ERROR(status) ((((ULONG) (status)) >> 30) == 3)
 #endif
 
+/* Linux symlinks exposed by WSL use a Microsoft reparse tag that is not the
+ * ordinary Win32 symlink tag.  Treating it as an ordinary file causes lstat
+ * to follow it, which is unsafe for a confined workspace scan. */
+#ifndef IO_REPARSE_TAG_LX_SYMLINK
+#define IO_REPARSE_TAG_LX_SYMLINK (0xA000001D)
+#endif
+
 /* END section originally copied from libuv win/winapi.h */
 
 static int nt_init_done = 0;
@@ -273,6 +280,28 @@ CAMLprim value win_has_correct_ctime(value unit)
   win_init();
 
   CAMLreturn (nt_api_available ? Val_true : Val_false);
+}
+
+CAMLprim value win_is_reparse_point(value path)
+{
+  CAMLparam1(path);
+  DWORD attributes;
+  wchar_t *wpath = caml_stat_strdup_to_utf16(String_val(path));
+
+  attributes = GetFileAttributesW(wpath);
+  caml_stat_free(wpath);
+
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+        error == ERROR_INVALID_NAME) {
+      CAMLreturn(Val_false);
+    }
+    caml_win32_maperr(error);
+    caml_uerror("is_reparse_point", path);
+  }
+
+  CAMLreturn((attributes & FILE_ATTRIBUTE_REPARSE_POINT) ? Val_true : Val_false);
 }
 
 #define MAKEDWORDLONG(a,b) ((DWORDLONG)(((DWORD)(a))|(((DWORDLONG)((DWORD)(b)))<<32)))
@@ -347,9 +376,12 @@ CAMLprim value win_stat(value path, value lstat)
     DWORD read;
 
     if (DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, NULL, 0, buffer, 16384, &read, NULL)) {
-      if (((REPARSE_DATA_BUFFER*)buffer)->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+      ULONG tag = ((REPARSE_DATA_BUFFER*)buffer)->ReparseTag;
+      if (tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_LX_SYMLINK) {
         syml = 1;
-        size = ((REPARSE_DATA_BUFFER*)buffer)->SymbolicLinkReparseBuffer.SubstituteNameLength / 2;
+        if (tag == IO_REPARSE_TAG_SYMLINK) {
+          size = ((REPARSE_DATA_BUFFER*)buffer)->SymbolicLinkReparseBuffer.SubstituteNameLength / 2;
+        }
       }
     }
   }

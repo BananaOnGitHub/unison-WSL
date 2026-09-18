@@ -35,6 +35,7 @@ type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
 
 let stat = Unix.LargeFile.stat
 let lstat = Unix.LargeFile.lstat
+let isReparsePoint _ = false
 let rmdir = Unix.rmdir
 let mkdir = Unix.mkdir
 let unlink = Unix.unlink

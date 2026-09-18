@@ -832,6 +832,75 @@ let architecture =
     Umarshal.(prod3 bool bool bool id id)
     (fun (_,()) -> return (Sys.win32, Osx.isMacOSX, Sys.cygwin))
 
+let wslWorkspaceFatal message =
+  raise (Util.Fatal ("wslworkspace: " ^ message))
+
+let prepareWslWorkspacePrefs () =
+  if Prefs.read Wslworkspace.enabled then begin
+    if not Sys.win32 then
+      wslWorkspaceFatal "this mode must run in a native Windows build";
+    begin match Wslworkspace.validateRoots (Globals.rawRoots ()) with
+    | Ok () -> ()
+    | Error message -> wslWorkspaceFatal message
+    end;
+    if Pred.extern Path.followPred <> [] then
+      wslWorkspaceFatal
+        "the 'follow' preference is forbidden because it can escape a replica root";
+    if Pred.extern Globals.merge <> [] then
+      wslWorkspaceFatal
+        "the 'merge' preference is forbidden; conflicts must remain explicit";
+    begin match Prefs.read repeat with
+    | `Watch | `WatchAndInterval _ ->
+        wslWorkspaceFatal
+          "filesystem watcher repeat modes do not work on the WSL UNC share; use a numeric repeat interval"
+    | `NoRepeat | `Interval _ -> ()
+    | `Invalid (_, e) -> raise e
+    end;
+    if Prefs.read Fileinfo.allowSymlinks = `True then
+      wslWorkspaceFatal
+        "'links = true' is forbidden; workspace symlinks are not synchronized";
+    Prefs.set Fileinfo.allowSymlinks `False;
+    Prefs.set Fileinfo.ignoreInodeNumbers true;
+    Prefs.set Case.caseInsensitiveMode `True;
+    Prefs.set Props.permMask 0;
+    Prefs.set Props.dontChmod true
+  end
+
+let validateWslWorkspaceStorage () =
+  if Prefs.read Wslworkspace.enabled then begin
+    let roots =
+      Safelist.map
+        (function
+         | (Local, fspath) -> Fspath.toString fspath
+         | (Remote _, _) ->
+             wslWorkspaceFatal "remote roots are forbidden")
+        (Globals.rootsList ()) in
+    let configFspath = Fspath.canonize (Some Util.unisonDir) in
+    let configDir = Fspath.toString configFspath in
+    if Wslworkspace.classifyRoot configDir <> Wslworkspace.WindowsLocal then
+      wslWorkspaceFatal
+        "the Unison configuration and archive directory must be on a local Windows drive";
+    if Fs.isReparsePoint configFspath then
+      wslWorkspaceFatal
+        "the Unison configuration and archive directory must not be a reparse point";
+    if Safelist.exists
+         (fun root -> Wslworkspace.isWithin ~root configDir) roots then
+      wslWorkspaceFatal
+        "the Unison configuration and archive directory must be outside both replicas";
+    Safelist.iter
+      (fun filename ->
+        let filename = Fspath.canonize (Some filename) in
+        let filenameString = Fspath.toString filename in
+        if Fs.isReparsePoint filename then
+          wslWorkspaceFatal
+            ("preference file must not be a reparse point: " ^ filenameString);
+        if not (Wslworkspace.isWithin ~root:configDir filenameString) then
+          wslWorkspaceFatal
+            ("preference file is outside the trusted Windows configuration "
+             ^ "directory: " ^ filenameString))
+      (Prefs.loadedProfileFiles ())
+  end
+
 (* During startup the client determines the case sensitivity of each root.
    If any root is case insensitive, all roots must know this -- it's
    propagated in a pref.  Also, detects HFS (needed for resource forks) and
@@ -947,6 +1016,8 @@ let initRoots displayWaitMessage termInteract =
   (* Canonize the names of the roots, sort them (with local roots first),
      and install them in Globals. *)
   Lwt_unix.run (Globals.installRoots termInteract);
+
+  validateWslWorkspaceStorage ();
 
   Files.processCommitLogs ();
 
@@ -1111,6 +1182,8 @@ let initPrefs ~profileName ~promptForRoots ?(prepDebug = fun () -> ()) () =
       parsedRoots in
       if numRemote > 1 then
         raise(Util.Fatal "cannot synchronize more than one remote root");
+
+  prepareWslWorkspacePrefs ();
 
   Recon.checkThatPreferredRootIsValid();
 

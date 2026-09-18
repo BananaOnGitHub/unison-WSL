@@ -80,6 +80,10 @@ let mbasic = minfo Props.mbasic
 (* Stat function that pays attention to pref for following links             *)
 let statFn fromRoot fspath path =
   let fullpath = Fspath.concat fspath path in
+  if Prefs.read Wslworkspace.enabled && Fs.isReparsePoint fullpath then
+    raise (Util.Transient (Printf.sprintf
+      "wslworkspace refuses to traverse the reparse point %s"
+      (Fspath.toPrintString fullpath)));
   let stats = Fs.lstat fullpath in
   if stats.Unix.LargeFile.st_kind = Unix.S_LNK
      && fromRoot

@@ -46,6 +46,8 @@ let stat f = System.stat (path f)
 
 let lstat f = System.lstat (path f)
 
+let isReparsePoint f = System.isReparsePoint (path f)
+
 let openfile f flags perms = System.openfile (path f) flags perms
 
 let opendir f = System.opendir (path f)

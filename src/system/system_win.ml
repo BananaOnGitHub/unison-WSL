@@ -56,6 +56,8 @@ let sys_error e =
 external stat_impl : string -> bool -> Unix.LargeFile.stats = "win_stat"
 let stat f = stat_impl f false
 let lstat f = stat_impl f true
+external is_reparse_point_impl : string -> bool = "win_is_reparse_point"
+let isReparsePoint = is_reparse_point_impl
 
 let rename f1 f2 =
   let rename_with_readonly_fix () =

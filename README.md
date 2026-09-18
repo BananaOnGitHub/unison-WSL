@@ -2,6 +2,12 @@
 
 # Unison File Synchronizer
 
+> This repository is a security-oriented fork for a native Windows process
+> synchronizing a local workspace with a passive WSL2 workspace over
+> `\\wsl.localhost`. The dedicated mode is under development and is not yet
+> approved for real workspace data. See
+> [Windows-to-WSL workspace mode](doc/wsl-workspace-mode.md).
+
 ## Meta
 
 ***Please read this entire README and

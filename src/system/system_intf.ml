@@ -32,6 +32,8 @@ val mkdir : fspath -> Unix.file_perm -> unit
 val rename : fspath -> fspath -> unit
 val stat : fspath -> Unix.LargeFile.stats
 val lstat : fspath -> Unix.LargeFile.stats
+(* True for a Windows reparse point. Other systems return false. *)
+val isReparsePoint : fspath -> bool
 val opendir : fspath -> dir_handle
 val openfile :
   fspath -> Unix.open_flag list -> Unix.file_perm -> Unix.file_descr

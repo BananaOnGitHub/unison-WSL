@@ -188,6 +188,7 @@ features.cmx : \
     features.cmi
 features.cmi :
 fileinfo.cmo : \
+    wslworkspace.cmi \
     ubase/util.cmi \
     ubase/umarshal.cmi \
     system.cmi \
@@ -200,6 +201,7 @@ fileinfo.cmo : \
     fs.cmi \
     fileinfo.cmi
 fileinfo.cmx : \
+    wslworkspace.cmx \
     ubase/util.cmx \
     ubase/umarshal.cmx \
     system.cmx \
@@ -502,6 +504,7 @@ fswatchold.cmi : \
     lwt/lwt.cmi \
     fspath.cmi
 globals.cmo : \
+    wslworkspace.cmi \
     ubase/util.cmi \
     ubase/umarshal.cmi \
     ubase/trace.cmi \
@@ -520,6 +523,7 @@ globals.cmo : \
     clroot.cmi \
     globals.cmi
 globals.cmx : \
+    wslworkspace.cmx \
     ubase/util.cmx \
     ubase/umarshal.cmx \
     ubase/trace.cmx \
@@ -1078,6 +1082,7 @@ terminal.cmi : \
     lwt/lwt_unix.cmi \
     lwt/lwt.cmi
 test.cmo : \
+    wslworkspace.cmi \
     uutil.cmi \
     ubase/util.cmi \
     update.cmi \
@@ -1101,6 +1106,7 @@ test.cmo : \
     common.cmi \
     test.cmi
 test.cmx : \
+    wslworkspace.cmx \
     uutil.cmx \
     ubase/util.cmx \
     update.cmx \
@@ -1292,6 +1298,7 @@ ubase/util.cmx : \
 ubase/util.cmi :
 ui.cmi :
 uicommon.cmo : \
+    wslworkspace.cmi \
     xferhint.cmi \
     uutil.cmi \
     ubase/util.cmi \
@@ -1325,6 +1332,7 @@ uicommon.cmo : \
     abort.cmi \
     uicommon.cmi
 uicommon.cmx : \
+    wslworkspace.cmx \
     xferhint.cmx \
     uutil.cmx \
     ubase/util.cmx \
@@ -1365,6 +1373,14 @@ uicommon.cmi : \
     path.cmi \
     lwt/lwt.cmi \
     common.cmi
+wslworkspace.cmo : \
+    ubase/prefs.cmi \
+    wslworkspace.cmi
+wslworkspace.cmx : \
+    ubase/prefs.cmx \
+    wslworkspace.cmi
+wslworkspace.cmi : \
+    ubase/prefs.cmi
 uigtk3.cmo : \
     uutil.cmi \
     ubase/util.cmi \

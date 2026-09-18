@@ -284,7 +284,8 @@ let atomic = Pred.create "atomic"
 
 let shouldIgnore p =
   let p = Path.toString p in
-  (Pred.test ignorePred p) && not (Pred.test ignorenotPred p)
+  (Prefs.read Wslworkspace.enabled && Wslworkspace.isGitMetadataPath p)
+  || ((Pred.test ignorePred p) && not (Pred.test ignorenotPred p))
 
 let addRegexpToIgnore re =
   let oldRE = Pred.extern ignorePred in

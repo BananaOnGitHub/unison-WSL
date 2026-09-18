@@ -159,6 +159,9 @@ val profilePathname : ?add_ext:bool -> string -> string
 (* Check whether the profile file is unchanged                               *)
 val profileUnchanged : unit -> bool
 
+(* Files that contributed preferences during the current profile load. *)
+val loadedProfileFiles : unit -> string list
+
 (* Add a new preference to the file on disk (the result is a diagnostic      *)
 (* message that can be displayed to the user to verify where the new pref    *)
 (* went)                                                                     *)

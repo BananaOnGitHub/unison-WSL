@@ -48,6 +48,8 @@ let profileUnchanged () =
          false)
     !profileFiles
 
+let loadedProfileFiles () = Safelist.map fst !profileFiles
+
 (* ------------------------------------------------------------------------- *)
 
 (* When preferences change, we need to dump them out to the file we loaded   *)

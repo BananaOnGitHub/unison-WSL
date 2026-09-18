@@ -346,6 +346,49 @@ let test() =
 
   let assert_eq a b err () = if a = b then None else Some err in
 
+  check_assert "wslworkspace root policy" (fun () ->
+    let valid = [
+      ["C:\\Users\\tester\\workspace";
+       "\\\\wsl.localhost\\Ubuntu-26.04\\home\\tester\\workspace"];
+      ["//wsl.localhost/Ubuntu-26.04/home/tester/workspace";
+       "D:/work/agent"]
+    ] in
+    let invalid = [
+      ["C:\\Users\\tester\\workspace"; "D:\\other"];
+      ["relative";
+       "\\\\wsl.localhost\\Ubuntu-26.04\\home\\tester\\workspace"];
+      ["C:\\Users\\tester\\workspace";
+       "\\\\wsl$\\Ubuntu-26.04\\home\\tester\\workspace"];
+      ["C:\\Users\\tester\\workspace";
+       "\\\\wsl.localhost\\Ubuntu-26.04\\home\\..\\etc"]
+    ] in
+    let validOk = List.for_all
+      (fun roots -> Wslworkspace.validateRoots roots = Ok ()) valid in
+    let invalidOk = List.for_all
+      (fun roots -> match Wslworkspace.validateRoots roots with
+                    | Error _ -> true | Ok () -> false) invalid in
+    if validOk && invalidOk then None
+    else Some "WSL workspace root validation accepted an unsafe root set") ;
+
+  check_assert "wslworkspace Git metadata policy" (fun () ->
+    let ignored = [".git"; "repo/.git/index"; "repo/.GIT/HEAD"] in
+    let ordinary = [".github/workflows/ci.yml"; "git/file"; "repo/.gitignore"] in
+    if List.for_all Wslworkspace.isGitMetadataPath ignored &&
+       List.for_all (fun p -> not (Wslworkspace.isGitMetadataPath p)) ordinary
+    then None
+    else Some "WSL workspace Git metadata classification failed") ;
+
+  check_assert "wslworkspace configuration containment" (fun () ->
+    let root = "C:\\Users\\tester\\.unison" in
+    if Wslworkspace.isWithin ~root
+         "C:\\Users\\tester\\.unison\\agent.prf" &&
+       not (Wslworkspace.isWithin ~root
+         "C:\\Users\\tester\\.unison-evil\\agent.prf") &&
+       not (Wslworkspace.isWithin ~root
+         "\\\\wsl.localhost\\Ubuntu-26.04\\home\\tester\\agent.prf")
+    then None
+    else Some "WSL workspace configuration containment failed") ;
+
   (* N.b.: When making up tests, it's important to choose file contents of different
      lengths.  The reason for this is that, on some Unix systems, it is possible for
      the inode number of a just-deleted file to be reassigned to the very next file
