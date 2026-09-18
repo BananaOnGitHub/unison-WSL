@@ -336,3 +336,4 @@ let inspect worktree =
         (Unix.error_message error))
   | Sys_error message -> Unsupported message
   | Failure message -> Unsupported message
+  | Invalid_argument message -> Unsupported message
