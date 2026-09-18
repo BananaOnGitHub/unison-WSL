@@ -90,13 +90,59 @@ enumerated. The reader rejects truncation or growth observed during a bounded
 file read, but same-length in-place rewrites and cross-file snapshot skew are
 reported only through the existing busy/conflict logic when that Git transaction
 layer is integrated. Native Windows builds also fail closed if the required NT
-handle APIs are unavailable. The primitive covers only the read-only Git
-inspector; ordinary workspace scanning still uses Unison's existing
-reparse-point protections and is outside this milestone.
+handle APIs are unavailable. Ordinary workspace scanning still uses Unison's
+existing reparse-point protections and is outside this work.
 
-The foundation remains limited to disposable fixtures because Git object/ref
-propagation and the main transaction integration are not implemented yet. Do
-not point it at the real workspace.
+### Git object transfer
+
+The current branch can now make the immutable object closure reachable from an
+already-inspected `Gitstate.snapshot` available in the other existing
+repository. This is a standalone library operation only: it does **not** write
+`HEAD`, refs, `packed-refs`, indexes, working trees, repository configuration,
+or Unison archives, and it is not yet called by a normal synchronization run.
+
+The walker starts only from the snapshot's detached `HEAD` object and supported
+durable refs (following validated symbolic refs inside that snapshot). It
+validates every object identifier before deriving its two-component
+`objects/xx/yyyy…` name, expands commits, trees, annotated tags, and parents,
+and transfers blobs exactly as Git object data. Tree gitlinks (`160000`) are
+rejected, so submodules remain unsupported. No `.git` directory is copied as a
+filesystem subtree.
+
+Loose objects are read from a confined handle, zlib-checked, bounded, parsed as
+a canonical Git object, and hashed as SHA-1 or SHA-256 before they are usable.
+For standard packed repositories, the implementation supports version-2
+`.idx` files and matching `.pack` files. It validates pack/index/filename
+checksums, every indexed object boundary and object hash, and OFS/REF delta
+chains before publishing a pack pair. The supported transfer limits are 64 MiB
+per compressed loose object, 128 MiB after expansion/per packed object, 512
+MiB per pack, and one million packed or reachable objects; exceeding a limit
+fails closed. Legacy v1 indexes, multi-pack indexes, promisor/partial-clone
+state, and object alternates are unsupported. In particular,
+`objects/info/alternates` is rejected rather than followed.
+
+Destination publication is also handle-relative. The Windows backend creates a
+new temporary regular file beneath the already-confined object directory with
+`NtCreateFile`, writes and flushes it, then uses an `NtSetInformationFile`
+relative no-replace rename to publish it. The temporary name cannot cause a
+write through a reparse point; an existing destination name—including a raced
+reparse point—causes a collision and is reopened/validated through a confined
+handle. Existing loose objects are accepted only when their canonical content
+matches the requested object ID; existing pack and index files are never
+overwritten and must be byte-for-byte identical. Failed staging attempts delete
+the temporary handle. A pack is published before its index, so an interruption
+can leave an unindexed but checksum-validated immutable pack; it does not move
+any repository-visible ref and no temporary control artifact is left behind.
+
+This is still not a transaction boundary. A hostile replica can race ordinary
+in-place writes while a snapshot is being collected, or replace a valid object
+after this library releases its handle. Hash and checksum verification catches
+changed content during this operation, and all path/reparse replacement races
+on reads and writes fail closed, but cross-object snapshot consistency and
+quiescence are deferred to the later Git/ref transaction milestone.
+
+The branch remains limited to disposable fixtures until this library is wired
+into the later Git/ref transaction. Do not point it at the real workspace.
 
 ## Git policy
 
@@ -153,13 +199,14 @@ trusted Windows-side state directory outside both workspaces. Nothing under
 either workspace is used as synchronizer control state.
 
 This is the target transaction boundary. The branch currently contains the
-Git ref reconciler, safe read-only repository inspection, and trusted-state
-archive; propagation is not wired into a synchronization run yet.
+Git ref reconciler, safe read-only repository inspection, handle-confined
+immutable-object transfer, and trusted-state archive; none is wired into a
+synchronization run yet.
 
 | Category | Treatment |
 | --- | --- |
 | Ordinary working files | Existing Unison archive/reconciliation; byte-exact |
-| Git objects | Safe union/copy after a quiescence check; never blindly deleted |
+| Git objects | Validated immutable closure union; no ref mutation or deletion |
 | `HEAD` and durable refs | Windows-side three-way Git-state archive; conflicts fail closed |
 | Index, reflogs, hooks, config, locks, operation scratch | Replica-local; never propagated as shared state |
 | Synchronizer state and diagnostics | Trusted Windows-side state directory only |
@@ -192,6 +239,11 @@ through the retained handle. Reparse-point versions of `HEAD`, `packed-refs`,
 and `refs` must all make inspection fail closed. The PowerShell fixture script
 runs that self-test across a disposable Windows root and a disposable
 `\\wsl.localhost\Ubuntu-26.04` root, in addition to its workspace smoke tests.
+It also transfers a fixed loose commit/tree/blob closure, a verified v2 packed
+commit graph, and a SHA-256 loose object without invoking Git. Focused fixtures
+cover already-present objects, malformed/truncated loose data, alternates,
+invalid object identifiers, retained-source-handle replacement, destination
+directory/final-name reparse races, and temporary-file cleanup.
 
 Only after those pass should clean real replicas be established from a chosen
 source of truth and synchronized for the first time.

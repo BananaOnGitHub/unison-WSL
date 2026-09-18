@@ -849,6 +849,260 @@ let test() =
     | Some (Common.Remote _, _) | None ->
         Some "Git reparse rejection test requires a local root") ;
 
+  (* ---------------------------------------------------------------------- *)
+  (* Focused Git object-transfer fixtures.  These use fixed, independently
+     constructed Git bytes and never invoke Git.  The packed fixture is a
+     normal v2 pack/index pair with a commit/tree/blob closure. *)
+
+  let base64Decode source =
+    let value = function
+      | 'A' .. 'Z' as c -> Char.code c - Char.code 'A'
+      | 'a' .. 'z' as c -> Char.code c - Char.code 'a' + 26
+      | '0' .. '9' as c -> Char.code c - Char.code '0' + 52
+      | '+' -> 62 | '/' -> 63 | '=' -> -1
+      | _ -> invalid_arg "invalid test base64" in
+    if String.length source mod 4 <> 0 then invalid_arg "invalid test base64 length";
+    let output = Buffer.create (String.length source / 4 * 3) in
+    for index = 0 to String.length source / 4 - 1 do
+      let a = value source.[index * 4]
+      and b = value source.[index * 4 + 1]
+      and c = value source.[index * 4 + 2]
+      and d = value source.[index * 4 + 3] in
+      if a < 0 || b < 0 || (c < 0 && d >= 0) then invalid_arg "invalid test base64 padding";
+      Buffer.add_char output (Char.chr ((a lsl 2) lor (b lsr 4)));
+      if c >= 0 then Buffer.add_char output
+        (Char.chr (((b land 15) lsl 4) lor (c lsr 2)));
+      if d >= 0 then Buffer.add_char output
+        (Char.chr (((c land 3) lsl 6) lor d))
+    done;
+    Buffer.contents output in
+
+  let gitBlobOid = "ce013625030ba8dba906f756967f9e9ca394464a" in
+  let gitTreeOid = "4cf9f177c4c015836fca6a31f9c3917e89ae29ec" in
+  let gitCommitOid = "4bc3bf977f1b7c4f78a17bfb43dedfa3e8ac4ebc" in
+  let gitBlobLoose = base64Decode "eJxLyslPUjBjyEjNycnnAgAdxQQU" in
+  let gitTreeLoose = base64Decode
+    "eJwrKUpNVTA2YzA0MDAzMVFIy8xJ1SupKGE4x2imysy94vZKtu9h0+rnzVk8xc0LAC1uD4Q=" in
+  let gitCommitLoose = base64Decode
+    "eJyNjUEKAjEMAD33FbkL0ti63YCIj/ADIaYYaHdlN4rPd/EFzmFOAyNz7+aAOe98UYUslSqWIlkinsY0VOGBE1aSRFh0JNYjqQR++WNe4Karw9k3X/XD/dn0YNObm90vEGEfN4L8Hq7/1cEmc+MWvtCtMTg=" in
+  let gitPackStem = "fea9f70a05df78d82eeedaf29eb693b31d0cdf70" in
+  let gitPack = base64Decode
+    "UEFDSwAAAAIAAAADNnicy0jNycnnAgAISwIfpAJ4nDM0MDAzMVFIy8xJ1SupKGE4x2imysy94vZKtu9h0+rnzVk8xc0LANC5DUuQCXicjcpBCsIwEEbhfU4xe0ESU5sOiHgILzCMf3AgaaUdxePbI/gW3+r5CtCglWsqRQeN6TzlsaqMklNlzZwKJhacGBrk7c9lpTs2p4vv3vCV/mo42vyRZo8rRTrEvaBL7+aO/+5gs7lJCz/jkS32/qn3CgXfeNgu7trynraTsx0M33A=" in
+  let gitIndex = base64Decode
+    "/3RPYwAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADAAAAAwAAAAMAAAADS8O/l38bfE94oXv7Q97fo+isTrxM+fF3xMAVg2/KajH5w5F+ia4p7M4BNiUDC6jbqQb3VpZ/npyjlEZKAAAAAAAAAAAAAAAAAAAASgAAABsAAAAM/qn3CgXfeNgu7trynraTsx0M33C/ZsdUExsCckPEnFR69BqGn3NSTA==" in
+
+  let gitObjectPath repo oid =
+    extend (extend (extend repo ".git") "objects")
+      (String.sub oid 0 2 ^ "/" ^ String.sub oid 2 (String.length oid - 2)) in
+
+  let writeGitObject repo oid contents =
+    let directory = extend (extend (extend repo ".git") "objects")
+      (String.sub oid 0 2) in
+    if not (Fs.file_exists directory) then Fs.mkdir directory default_perm;
+    write (extend directory (String.sub oid 2 (String.length oid - 2))) contents in
+
+  let writeGitSkeleton repo oid =
+    writefs repo (Dir [
+      ".git", Dir [
+        "HEAD", File "ref: refs/heads/main\n";
+        "refs", Dir ["heads", Dir ["main", File (oid ^ "\n")]];
+        "objects", Dir []
+      ]
+    ]) in
+
+  let gitSnapshot repo =
+    match Gitrepo.inspect repo with
+    | Gitrepo.Ready snapshot -> snapshot
+    | Gitrepo.Missing -> failwith "test Git repository unexpectedly missing"
+    | Gitrepo.Busy message | Gitrepo.Unsupported message ->
+        failwith ("test Git repository is unsupported: " ^ message) in
+
+  check_assert "gitobjects transfers a loose commit/tree/blob closure without refs" (fun () ->
+    if not Sys.win32 then None
+    else match r1, r2 with
+    | (Common.Local, sourceRoot), (Common.Local, destinationRoot) ->
+        let source = extend sourceRoot "git-object-loose-source" in
+        let destination = extend destinationRoot "git-object-loose-destination" in
+        writeGitSkeleton source gitCommitOid;
+        writeGitObject source gitBlobOid gitBlobLoose;
+        writeGitObject source gitTreeOid gitTreeLoose;
+        writeGitObject source gitCommitOid gitCommitLoose;
+        writeGitSkeleton destination gitCommitOid;
+        let sourceSnapshot = gitSnapshot source in
+        let destinationBefore = gitSnapshot destination in
+        begin match Gitobjects.transfer ~source ~destination sourceSnapshot with
+        | Ok report when report.objects_seen = 3 &&
+                         report.loose_objects_installed = 3 &&
+                         report.pack_files_installed = 0 &&
+                         gitSnapshot destination = destinationBefore &&
+                         read (gitObjectPath destination gitBlobOid) = gitBlobLoose &&
+                         read (gitObjectPath destination gitTreeOid) = gitTreeLoose &&
+                         read (gitObjectPath destination gitCommitOid) = gitCommitLoose ->
+            begin match Gitobjects.transfer ~source ~destination sourceSnapshot with
+            | Ok repeat when repeat.loose_objects_installed = 0 &&
+                             repeat.pack_files_installed = 0 -> None
+            | Ok _ -> Some "already-present loose Git objects were rewritten"
+            | Error message -> Some ("second loose object transfer failed: " ^ message)
+            end
+        | Ok _ -> Some "loose Git object transfer did not preserve the full closure or refs"
+        | Error message -> Some ("loose Git object transfer failed: " ^ message)
+        end
+    | _ -> Some "Git object transfer fixture requires two local roots") ;
+
+  check_assert "gitobjects transfers and validates a packed commit graph" (fun () ->
+    if not Sys.win32 then None
+    else match r1, r2 with
+    | (Common.Local, sourceRoot), (Common.Local, destinationRoot) ->
+        let source = extend sourceRoot "git-object-pack-source" in
+        let destination = extend destinationRoot "git-object-pack-destination" in
+        writeGitSkeleton source gitCommitOid;
+        let packDirectory = extend (extend (extend source ".git") "objects") "pack" in
+        Fs.mkdir packDirectory default_perm;
+        write (extend packDirectory ("pack-" ^ gitPackStem ^ ".pack")) gitPack;
+        write (extend packDirectory ("pack-" ^ gitPackStem ^ ".idx")) gitIndex;
+        writeGitSkeleton destination gitCommitOid;
+        let sourceSnapshot = gitSnapshot source in
+        let destinationBefore = gitSnapshot destination in
+        begin match Gitobjects.transfer ~source ~destination sourceSnapshot with
+        | Ok report when report.objects_seen = 3 &&
+                         report.loose_objects_installed = 0 &&
+                         report.pack_files_installed = 2 &&
+                         gitSnapshot destination = destinationBefore &&
+                         read (extend (extend (extend destination ".git") "objects")
+                           ("pack/pack-" ^ gitPackStem ^ ".pack")) = gitPack &&
+                         read (extend (extend (extend destination ".git") "objects")
+                           ("pack/pack-" ^ gitPackStem ^ ".idx")) = gitIndex -> None
+        | Ok _ -> Some "packed Git object transfer did not preserve graph, pack pair, or refs"
+        | Error message -> Some ("packed Git object transfer failed: " ^ message)
+        end
+    | _ -> Some "packed Git object fixture requires two local roots") ;
+
+  check_assert "gitobjects validates SHA-256 loose object identifiers" (fun () ->
+    if not Sys.win32 then None
+    else match r1, r2 with
+    | (Common.Local, sourceRoot), (Common.Local, destinationRoot) ->
+        let oid = "7228341094873855aab16bee01cec898a1d98688a59553d58eddd1a18a62c6e5" in
+        let compressed = base64Decode "eJxLyslPUjBnKM5INDI14wIAINYD2g==" in
+        let source = extend sourceRoot "git-object-sha256-source" in
+        let destination = extend destinationRoot "git-object-sha256-destination" in
+        writeGitSkeleton source oid;
+        writeGitObject source oid compressed;
+        writeGitSkeleton destination oid;
+        begin match Gitobjects.transfer ~source ~destination (gitSnapshot source) with
+        | Ok report when report.objects_seen = 1 && report.loose_objects_installed = 1 &&
+                         read (gitObjectPath destination oid) = compressed -> None
+        | Ok _ -> Some "SHA-256 Git object transfer did not preserve its object"
+        | Error message -> Some ("SHA-256 Git object transfer failed: " ^ message)
+        end
+    | _ -> Some "SHA-256 Git object fixture requires two local roots") ;
+
+  check_assert "gitobjects rejects malformed, changing, and alternate object sources" (fun () ->
+    if not Sys.win32 then None
+    else match r1, r2 with
+    | (Common.Local, sourceRoot), (Common.Local, destinationRoot) ->
+        let source = extend sourceRoot "git-object-bad-source" in
+        let destination = extend destinationRoot "git-object-bad-destination" in
+        let fails contents alternates =
+          writeGitSkeleton source gitCommitOid;
+          if alternates then begin
+            let info = extend (extend (extend source ".git") "objects") "info" in
+            Fs.mkdir info default_perm;
+            write (extend info "alternates") "C:\\outside\n"
+          end else writeGitObject source gitCommitOid contents;
+          writeGitSkeleton destination gitCommitOid;
+          match Gitobjects.transfer ~source ~destination (gitSnapshot source) with
+          | Error _ -> not (Fs.file_exists (gitObjectPath destination gitCommitOid))
+          | Ok _ -> false in
+        let invalidSnapshot = { Gitstate.head = Gitstate.Present "not-an-object"; refs = [] } in
+        let malformed = fails
+          (String.sub gitCommitLoose 0 (String.length gitCommitLoose - 1)) false in
+        let alternate = fails "" true in
+        writeGitSkeleton source gitCommitOid;
+        writeGitObject source gitCommitOid gitCommitLoose;
+        writeGitSkeleton destination gitCommitOid;
+        let badName = match Gitobjects.transfer ~source ~destination invalidSnapshot with
+          | Error _ -> true | Ok _ -> false in
+        if malformed && alternate && badName then None
+        else Some "Git object transfer accepted malformed source metadata"
+    | _ -> Some "malformed Git object fixture requires two local roots") ;
+
+  check_assert "gitobjects source replacement and destination reparse races fail closed" (fun () ->
+    if not Sys.win32 then None
+    else match List.find_opt (function
+      | Common.Local, root ->
+          Wslworkspace.classifyRoot (Fspath.toString root) = Wslworkspace.WindowsLocal
+      | Common.Remote _, _ -> false) [r1; r2] with
+    | None -> Some "Git object race fixture requires a Windows local disposable root"
+    | Some (Common.Local, root) ->
+        let source = extend root "git-object-race-source" in
+        let destination = extend root "git-object-race-destination" in
+        let outside = extend root "git-object-race-outside" in
+        writeGitSkeleton source gitCommitOid;
+        writeGitObject source gitCommitOid gitCommitLoose;
+        writeGitSkeleton destination gitCommitOid;
+        writefs outside (Dir ["outside", File "outside\n"]);
+        let sourcePath = gitObjectPath source gitCommitOid in
+        let replacement = extend source "replacement-object" in
+        write replacement "not a Git object";
+        let retained = match Fs.confinedOpen source
+          [".git"; "objects"; String.sub gitCommitOid 0 2;
+           String.sub gitCommitOid 2 38] with
+          | Some handle -> handle
+          | None -> failwith "source object disappeared before race test" in
+        Fs.rename replacement sourcePath;
+        let retainedContents =
+          try Fs.confinedRead retained (64 * 1024 * 1024)
+          with error -> Fs.confinedClose retained; raise error in
+        Fs.confinedClose retained;
+        let gitDirectory = match Fs.confinedOpen destination [".git"] with
+          | Some handle -> handle | None -> failwith "destination .git disappeared" in
+        let objectsDirectory = match Fs.confinedOpenWritableDirectory gitDirectory "objects" with
+          | Some handle -> handle | None -> failwith "destination objects disappeared" in
+        let prefix = Fs.confinedEnsureDirectory objectsDirectory (String.sub gitCommitOid 0 2) in
+        let suffix = String.sub gitCommitOid 2 38 in
+        let installed = Fs.confinedInstall prefix suffix retainedContents in
+        Fs.confinedClose prefix;
+        Fs.confinedClose objectsDirectory;
+        Fs.confinedClose gitDirectory;
+        (* A final-name reparse collision must leave no staged implementation
+           file behind and may never redirect the destination write. *)
+        let racePrefix = extend (extend (extend destination ".git") "objects") "aa" in
+        Fs.mkdir racePrefix default_perm;
+        let target = extend racePrefix "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in
+        Fs.symlink (Fspath.toString (extend outside "outside")) target;
+        let gitDirectory = match Fs.confinedOpen destination [".git"] with
+          | Some handle -> handle | None -> failwith "destination .git disappeared" in
+        let objectsDirectory = match Fs.confinedOpenWritableDirectory gitDirectory "objects" with
+          | Some handle -> handle | None -> failwith "destination objects disappeared" in
+        let raceHandle = match Fs.confinedOpenWritableDirectory objectsDirectory "aa" with
+          | Some handle -> handle | None -> failwith "destination race directory disappeared" in
+        let collision = Fs.confinedInstall raceHandle
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" gitCommitLoose in
+        Fs.confinedClose raceHandle;
+        Fs.confinedClose objectsDirectory;
+        Fs.confinedClose gitDirectory;
+        let leftovers = read_dir racePrefix
+          |> List.filter (fun name -> startsWith name ".unison-object-") in
+        let retainedInstalled =
+          read (gitObjectPath destination gitCommitOid) = gitCommitLoose in
+        (* A destination object-directory replacement is rejected by the
+           Gitobjects path before it can create a child under [outside]. *)
+        writeGitSkeleton source gitCommitOid;
+        writeGitObject source gitCommitOid gitCommitLoose;
+        writeGitSkeleton destination gitCommitOid;
+        let destinationPrefix = extend (extend (extend destination ".git") "objects")
+          (String.sub gitCommitOid 0 2) in
+        Fs.symlink (Fspath.toString outside) destinationPrefix;
+        let reparseRejected = match Gitobjects.transfer ~source ~destination
+          (gitSnapshot source) with Error _ -> true | Ok _ -> false in
+        if retainedContents = gitCommitLoose && installed = Fs.ConfinedInstalled &&
+           retainedInstalled &&
+           collision = Fs.ConfinedAlreadyPresent && leftovers = [] &&
+           reparseRejected && read (extend outside "outside") = "outside\n"
+        then None
+        else Some "Git object transfer followed a replacement/reparse path or left a staged file"
+    | Some (Common.Remote _, _) -> assert false) ;
+
   (* N.b.: When making up tests, it's important to choose file contents of different
      lengths.  The reason for this is that, on some Unix systems, it is possible for
      the inode number of a just-deleted file to be reassigned to the very next file

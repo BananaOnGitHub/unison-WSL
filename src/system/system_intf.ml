@@ -28,6 +28,7 @@ type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
  * tests, but are not a confinement boundary. *)
 type confined_kind = ConfinedFile | ConfinedDirectory
 type confined_handle
+type confined_install = ConfinedInstalled | ConfinedAlreadyPresent
 
 val symlink : string -> fspath -> unit
 val readlink : fspath -> string
@@ -53,6 +54,21 @@ val confinedKind : confined_handle -> confined_kind
 val confinedRead : confined_handle -> int -> string
 val confinedList : confined_handle -> string list
 val confinedClose : confined_handle -> unit
+
+(* These operations are deliberately separate from the ordinary filesystem
+ * API.  On Windows they create a child directory or publish a fully written
+ * temporary file relative to an already-confined directory handle.  They
+ * never turn that handle back into a pathname.  [confinedInstall] never
+ * replaces an existing name: it reports [ConfinedAlreadyPresent] instead. *)
+val confinedEnsureDirectory : confined_handle -> string -> confined_handle
+val confinedOpenWritableDirectory : confined_handle -> string -> confined_handle option
+val confinedInstall : confined_handle -> string -> string -> confined_install
+
+(* Inflate one zlib stream beginning at [offset], returning its bytes and the
+ * number of source bytes consumed.  Windows implements this without invoking
+ * Git or loading repository configuration.  It is used only after the input
+ * has been read through a confined handle. *)
+val confinedInflateZlib : string -> int -> int -> string * int
 
 val opendir : fspath -> dir_handle
 val openfile :

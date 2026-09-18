@@ -34,6 +34,7 @@ let argv () = Sys.argv
 type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
 
 type confined_kind = ConfinedFile | ConfinedDirectory
+type confined_install = ConfinedInstalled | ConfinedAlreadyPresent
 
 (* This fallback keeps the same handle-consuming API for non-Windows unit
  * tests.  It is deliberately not described as a confinement primitive: the
@@ -135,6 +136,22 @@ let confinedList handle =
 let confinedClose = function
   | ConfinedFileHandle descriptor -> Unix.close descriptor
   | ConfinedDirectoryHandle (_, directory) -> Unix.closedir directory
+
+(* The generic implementation intentionally has no write or inflate fallback.
+ * The dedicated WSL workspace mode is native-Windows-only; silently replacing
+ * the handle-relative implementation with pathname operations here would
+ * create a false security boundary in non-Windows builds. *)
+let confinedEnsureDirectory _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedEnsureDirectory", ""))
+
+let confinedOpenWritableDirectory _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedOpenWritableDirectory", ""))
+
+let confinedInstall _ _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedInstall", ""))
+
+let confinedInflateZlib _ _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedInflateZlib", ""))
 
 let stat = Unix.LargeFile.stat
 let lstat = Unix.LargeFile.lstat

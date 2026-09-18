@@ -67,6 +67,14 @@ external confined_kind_impl : confined_handle -> int = "win_confined_kind"
 external confined_read_impl : confined_handle -> int -> string = "win_confined_read"
 external confined_list_impl : confined_handle -> string list = "win_confined_list"
 external confined_close_impl : confined_handle -> unit = "win_confined_close"
+external confined_ensure_directory_impl : confined_handle -> string -> confined_handle =
+  "win_confined_ensure_directory"
+external confined_open_writable_directory_impl : confined_handle -> string -> confined_handle option =
+  "win_confined_open_writable_directory"
+external confined_install_impl : confined_handle -> string -> string -> int =
+  "win_confined_install"
+external confined_inflate_zlib_impl : string -> int -> int -> string * int =
+  "win_confined_inflate_zlib"
 
 let confinedOpen = confined_open_impl
 let confinedOpenChild = confined_open_child_impl
@@ -78,6 +86,14 @@ let confinedKind handle =
 let confinedRead = confined_read_impl
 let confinedList = confined_list_impl
 let confinedClose = confined_close_impl
+let confinedEnsureDirectory = confined_ensure_directory_impl
+let confinedOpenWritableDirectory = confined_open_writable_directory_impl
+let confinedInstall directory name contents =
+  match confined_install_impl directory name contents with
+  | 0 -> ConfinedInstalled
+  | 1 -> ConfinedAlreadyPresent
+  | _ -> invalid_arg "invalid confined install result"
+let confinedInflateZlib = confined_inflate_zlib_impl
 
 let rename f1 f2 =
   let rename_with_readonly_fix () =

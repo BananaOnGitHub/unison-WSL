@@ -21,6 +21,11 @@
 #endif
 #include <caml/osdeps.h>
 
+/* A compact, audited DEFLATE decoder used only to validate Git's zlib object
+ * payloads after they were read through a confined Windows handle.  It is
+ * vendored under its retained zlib-style license in ../puff.{c,h}. */
+#include "../puff.c"
+
 #if OCAML_VERSION_MAJOR < 5
 #define caml_uerror uerror
 #define caml_win32_maperr win32_maperr
@@ -276,6 +281,13 @@ typedef NTSTATUS (NTAPI *sNtQueryDirectoryFile)
                   PUNISON_UNICODE_STRING FileName,
                   BOOLEAN RestartScan);
 
+typedef NTSTATUS (NTAPI *sNtSetInformationFile)
+                 (HANDLE FileHandle,
+                  PIO_STATUS_BLOCK IoStatusBlock,
+                  PVOID FileInformation,
+                  ULONG Length,
+                  FILE_INFORMATION_CLASS FileInformationClass);
+
 typedef BOOLEAN (NTAPI *sRtlDosPathNameToNtPathNameU)
                 (PCWSTR DosName,
                  PUNISON_UNICODE_STRING NtName,
@@ -291,6 +303,7 @@ typedef ULONG (NTAPI *sRtlNtStatusToDosError)
 sNtQueryInformationFile pNtQueryInformationFile;
 sNtCreateFile pNtCreateFile;
 sNtQueryDirectoryFile pNtQueryDirectoryFile;
+sNtSetInformationFile pNtSetInformationFile;
 sRtlDosPathNameToNtPathNameU pRtlDosPathNameToNtPathNameU;
 sRtlFreeUnicodeString pRtlFreeUnicodeString;
 
@@ -318,8 +331,16 @@ sRtlNtStatusToDosError pRtlNtStatusToDosError;
 #define FILE_OPEN 0x00000001UL
 #endif
 
+#ifndef FILE_CREATE
+#define FILE_CREATE 0x00000002UL
+#endif
+
 #ifndef FILE_DIRECTORY_FILE
 #define FILE_DIRECTORY_FILE 0x00000001UL
+#endif
+
+#ifndef FILE_NON_DIRECTORY_FILE
+#define FILE_NON_DIRECTORY_FILE 0x00000040UL
 #endif
 
 #ifndef FILE_SYNCHRONOUS_IO_NONALERT
@@ -344,6 +365,10 @@ sRtlNtStatusToDosError pRtlNtStatusToDosError;
 
 #ifndef STATUS_NOT_A_DIRECTORY
 #define STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103L)
+#endif
+
+#ifndef STATUS_OBJECT_NAME_COLLISION
+#define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
 #endif
 
 /* Linux symlinks exposed by WSL use a Microsoft reparse tag that is not the
@@ -394,12 +419,15 @@ void win_init()
   pNtCreateFile = (sNtCreateFile) GetProcAddress(ntdll_module, "NtCreateFile");
   pNtQueryDirectoryFile = (sNtQueryDirectoryFile) GetProcAddress(
       ntdll_module, "NtQueryDirectoryFile");
+  pNtSetInformationFile = (sNtSetInformationFile) GetProcAddress(
+      ntdll_module, "NtSetInformationFile");
   pRtlDosPathNameToNtPathNameU = (sRtlDosPathNameToNtPathNameU) GetProcAddress(
       ntdll_module, "RtlDosPathNameToNtPathName_U");
   pRtlFreeUnicodeString = (sRtlFreeUnicodeString) GetProcAddress(
       ntdll_module, "RtlFreeUnicodeString");
   nt_confined_api_available =
     pNtCreateFile != NULL && pNtQueryDirectoryFile != NULL &&
+    pNtSetInformationFile != NULL &&
     pRtlDosPathNameToNtPathNameU != NULL && pRtlFreeUnicodeString != NULL;
 }
 
@@ -531,9 +559,22 @@ static int unison_confined_missing(NTSTATUS status)
          status == STATUS_NOT_A_DIRECTORY;
 }
 
-static NTSTATUS unison_confined_nt_open(
+typedef struct _UNISON_FILE_RENAME_INFORMATION {
+  BOOLEAN ReplaceIfExists;
+  HANDLE RootDirectory;
+  ULONG FileNameLength;
+  WCHAR FileName[1];
+} UNISON_FILE_RENAME_INFORMATION, *PUNISON_FILE_RENAME_INFORMATION;
+
+typedef struct _UNISON_FILE_DISPOSITION_INFORMATION {
+  BOOLEAN DeleteFile;
+} UNISON_FILE_DISPOSITION_INFORMATION, *PUNISON_FILE_DISPOSITION_INFORMATION;
+
+static NTSTATUS unison_confined_nt_create(
   HANDLE root,
   PUNISON_UNICODE_STRING name,
+  ACCESS_MASK desired_access,
+  ULONG disposition,
   ULONG create_options,
   HANDLE *opened)
 {
@@ -549,16 +590,37 @@ static NTSTATUS unison_confined_nt_open(
 
   return pNtCreateFile(
     opened,
-    FILE_GENERIC_READ | SYNCHRONIZE,
+    desired_access,
     &attributes,
     &io_status,
     NULL,
     FILE_ATTRIBUTE_NORMAL,
     FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-    FILE_OPEN,
+    disposition,
     create_options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
     NULL,
     0);
+}
+
+static NTSTATUS unison_confined_nt_open(
+  HANDLE root,
+  PUNISON_UNICODE_STRING name,
+  ULONG create_options,
+  HANDLE *opened)
+{
+  return unison_confined_nt_create(
+    root, name, FILE_GENERIC_READ | SYNCHRONIZE, FILE_OPEN,
+    create_options, opened);
+}
+
+static NTSTATUS unison_confined_delete_handle(HANDLE handle)
+{
+  IO_STATUS_BLOCK io_status;
+  UNISON_FILE_DISPOSITION_INFORMATION disposition;
+
+  disposition.DeleteFile = TRUE;
+  return pNtSetInformationFile(handle, &io_status, &disposition,
+                               sizeof disposition, FileDispositionInformation);
 }
 
 static int unison_confined_validate_handle(HANDLE handle, int *kind, DWORD *error)
@@ -650,6 +712,325 @@ static int unison_confined_handle_from_value(value handle_value,
 {
   *handle = (unison_confined_handle *) Data_custom_val(handle_value);
   return (*handle)->handle != INVALID_HANDLE_VALUE;
+}
+
+/* Directory handles used as publication roots need only the rights needed to
+ * create a child and rename a staged child into that same directory.  Source
+ * handles remain read-only. */
+#define UNISON_CONFINED_WRITE_DIRECTORY_ACCESS \
+  (FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE)
+
+static NTSTATUS unison_confined_open_directory_access(
+  unison_confined_handle *parent_handle, value name, ACCESS_MASK access,
+  HANDLE *opened)
+{
+  wchar_t *wide_name;
+  UNISON_UNICODE_STRING name_string;
+  NTSTATUS status;
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_nt_create(
+    parent_handle->handle, &name_string, access, FILE_OPEN,
+    FILE_DIRECTORY_FILE, opened);
+  caml_stat_free(wide_name);
+  return status;
+}
+
+CAMLprim value win_confined_open_writable_directory(value parent, value name)
+{
+  unison_confined_handle *parent_handle;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  int kind;
+  DWORD error;
+  CAMLparam2(parent, name);
+
+  if (!unison_confined_handle_from_value(parent, &parent_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (parent_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpenWritableDirectory", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+  status = unison_confined_open_directory_access(
+    parent_handle, name, UNISON_CONFINED_WRITE_DIRECTORY_ACCESS, &child);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+    unison_confined_raise_nt(status, "confinedOpenWritableDirectory", name);
+  }
+  if (!unison_confined_validate_handle(child, &kind, &error)) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(error, "confinedOpenWritableDirectory", name);
+  }
+  if (kind != UNISON_CONFINED_DIRECTORY) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(ERROR_DIRECTORY,
+                              "confinedOpenWritableDirectory", name);
+  }
+  CAMLreturn(unison_confined_alloc(child, kind));
+}
+
+CAMLprim value win_confined_ensure_directory(value parent, value name)
+{
+  unison_confined_handle *parent_handle;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  int kind;
+  DWORD error;
+  wchar_t *wide_name;
+  UNISON_UNICODE_STRING name_string;
+  CAMLparam2(parent, name);
+
+  if (!unison_confined_handle_from_value(parent, &parent_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (parent_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedEnsureDirectory", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_nt_create(
+    parent_handle->handle, &name_string, UNISON_CONFINED_WRITE_DIRECTORY_ACCESS,
+    FILE_CREATE, FILE_DIRECTORY_FILE, &child);
+  caml_stat_free(wide_name);
+  if (status == STATUS_OBJECT_NAME_COLLISION) {
+    status = unison_confined_open_directory_access(
+      parent_handle, name, UNISON_CONFINED_WRITE_DIRECTORY_ACCESS, &child);
+  }
+  if (!NT_SUCCESS(status)) {
+    unison_confined_raise_nt(status, "confinedEnsureDirectory", name);
+  }
+  if (!unison_confined_validate_handle(child, &kind, &error)) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(error, "confinedEnsureDirectory", name);
+  }
+  if (kind != UNISON_CONFINED_DIRECTORY) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(ERROR_DIRECTORY,
+                              "confinedEnsureDirectory", name);
+  }
+  CAMLreturn(unison_confined_alloc(child, kind));
+}
+
+static LONG unison_confined_temp_counter = 0;
+
+static int unison_confined_write_all(HANDLE handle, const char *contents,
+                                     mlsize_t length)
+{
+  mlsize_t offset = 0;
+  while (offset < length) {
+    DWORD written = 0;
+    DWORD requested = (DWORD) min((mlsize_t) (1 << 20), length - offset);
+    if (!WriteFile(handle, contents + offset, requested, &written, NULL) ||
+        written == 0) {
+      return 0;
+    }
+    offset += written;
+  }
+  return FlushFileBuffers(handle) != 0;
+}
+
+static NTSTATUS unison_confined_publish(HANDLE staged, HANDLE directory,
+                                        value name)
+{
+  wchar_t *wide_name;
+  size_t name_bytes;
+  size_t information_size;
+  PUNISON_FILE_RENAME_INFORMATION information;
+  IO_STATUS_BLOCK io_status;
+  NTSTATUS status;
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_bytes = wcslen(wide_name) * sizeof(WCHAR);
+  information_size = offsetof(UNISON_FILE_RENAME_INFORMATION, FileName) +
+                     name_bytes;
+  information = caml_stat_alloc(information_size);
+  information->ReplaceIfExists = FALSE;
+  information->RootDirectory = directory;
+  information->FileNameLength = (ULONG) name_bytes;
+  memcpy(information->FileName, wide_name, name_bytes);
+  caml_stat_free(wide_name);
+  status = pNtSetInformationFile(staged, &io_status, information,
+                                 (ULONG) information_size,
+                                 FileRenameInformation);
+  caml_stat_free(information);
+  return status;
+}
+
+/* Stage contents under a fresh process-local name and publish it
+ * into [directory] using an NT handle-relative, no-replace rename.  A target
+ * race can only produce an existing-name result; it cannot redirect this
+ * write through a reparse point or replace an existing object. */
+CAMLprim value win_confined_install(value directory, value name, value contents)
+{
+  unison_confined_handle *directory_handle;
+  HANDLE staged = INVALID_HANDLE_VALUE;
+  wchar_t temporary[96];
+  UNISON_UNICODE_STRING temporary_name;
+  NTSTATUS status;
+  int kind;
+  DWORD error;
+  int attempt;
+  CAMLparam3(directory, name, contents);
+
+  if (!unison_confined_handle_from_value(directory, &directory_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (directory_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedInstall", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+
+  for (attempt = 0; attempt < 32; attempt++) {
+    int written = _snwprintf_s(
+      temporary, sizeof temporary / sizeof temporary[0], _TRUNCATE,
+      L".unison-object-%08lx-%08lx-%08lx",
+      (unsigned long) GetCurrentProcessId(), (unsigned long) GetTickCount(),
+      (unsigned long) InterlockedIncrement(&unison_confined_temp_counter));
+    if (written < 0) {
+      unison_confined_fail_handle("confinedInstall could not make a temporary name");
+    }
+    temporary_name.Buffer = temporary;
+    temporary_name.Length = (USHORT) (wcslen(temporary) * sizeof(WCHAR));
+    temporary_name.MaximumLength = temporary_name.Length;
+    status = unison_confined_nt_create(
+      directory_handle->handle, &temporary_name,
+      FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE,
+      FILE_CREATE, FILE_NON_DIRECTORY_FILE, &staged);
+    if (status != STATUS_OBJECT_NAME_COLLISION) break;
+  }
+  if (!NT_SUCCESS(status)) {
+    unison_confined_raise_nt(status, "confinedInstall", name);
+  }
+  if (!unison_confined_validate_handle(staged, &kind, &error)) {
+    (void) unison_confined_delete_handle(staged);
+    (void) CloseHandle(staged);
+    unison_confined_raise_win(error, "confinedInstall", name);
+  }
+  if (kind != UNISON_CONFINED_FILE) {
+    (void) unison_confined_delete_handle(staged);
+    (void) CloseHandle(staged);
+    unison_confined_raise_win(ERROR_CANT_ACCESS_FILE, "confinedInstall", name);
+  }
+  if (!unison_confined_write_all(staged, String_val(contents),
+                                 caml_string_length(contents))) {
+    error = GetLastError();
+    if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
+    (void) unison_confined_delete_handle(staged);
+    (void) CloseHandle(staged);
+    unison_confined_raise_win(error, "confinedInstall", name);
+  }
+
+  status = unison_confined_publish(staged, directory_handle->handle, name);
+  if (status == STATUS_OBJECT_NAME_COLLISION) {
+    (void) unison_confined_delete_handle(staged);
+    (void) CloseHandle(staged);
+    CAMLreturn(Val_int(1));
+  }
+  if (!NT_SUCCESS(status)) {
+    (void) unison_confined_delete_handle(staged);
+    (void) CloseHandle(staged);
+    unison_confined_raise_nt(status, "confinedInstall", name);
+  }
+  (void) CloseHandle(staged);
+  CAMLreturn(Val_int(0));
+}
+
+static ULONG unison_adler32(const unsigned char *bytes, unsigned long length)
+{
+  ULONG a = 1;
+  ULONG b = 0;
+  while (length != 0) {
+    unsigned long chunk = length > 5552 ? 5552 : length;
+    length -= chunk;
+    while (chunk-- != 0) {
+      a += *bytes++;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return (b << 16) | a;
+}
+
+/* Inflate exactly one zlib stream from a larger byte string.  Pack parsing
+ * uses the returned byte count to continue at the next object; loose-object
+ * validation additionally requires that it consumed the whole input. */
+CAMLprim value win_confined_inflate_zlib(value source, value offset_value,
+                                         value maximum_value)
+{
+  mlsize_t length;
+  int offset;
+  int maximum;
+  const unsigned char *input;
+  unsigned long available;
+  unsigned long consumed;
+  unsigned long output_length;
+  int puff_result;
+  ULONG expected_adler;
+  ULONG actual_adler;
+  value output;
+  CAMLparam3(source, offset_value, maximum_value);
+  CAMLlocal2(result, pair);
+
+  offset = Int_val(offset_value);
+  maximum = Int_val(maximum_value);
+  length = caml_string_length(source);
+  if (offset < 0 || maximum < 0 || (mlsize_t) offset > length ||
+      length - (mlsize_t) offset < 6 ||
+      length - (mlsize_t) offset - 2 > (unsigned long) -1) {
+    unison_confined_fail_handle("confinedInflateZlib received invalid input");
+  }
+  input = (const unsigned char *) String_val(source) + offset;
+  if ((input[0] & 0x0f) != 8 || (input[0] >> 4) > 7 ||
+      (((unsigned int) input[0] << 8 | input[1]) % 31) != 0 ||
+      (input[1] & 0x20) != 0) {
+    unison_confined_fail_handle("confinedInflateZlib rejected a zlib header");
+  }
+
+  available = (unsigned long) (length - (mlsize_t) offset - 2);
+  consumed = available;
+  output_length = 0;
+  puff_result = puff(NIL, &output_length, input + 2, &consumed);
+  if (puff_result != 0 || output_length > (unsigned long) maximum ||
+      output_length > INT_MAX || consumed > available ||
+      consumed > available - 4) {
+    unison_confined_fail_handle("confinedInflateZlib rejected a deflate stream");
+  }
+  output = caml_alloc_string((mlsize_t) output_length);
+  available = (unsigned long) (length - (mlsize_t) offset - 2);
+  puff_result = puff((unsigned char *) String_val(output), &output_length,
+                     input + 2, &available);
+  if (puff_result != 0 || available != consumed) {
+    unison_confined_fail_handle("confinedInflateZlib could not reproduce a deflate stream");
+  }
+  expected_adler = ((ULONG) input[2 + consumed] << 24) |
+                   ((ULONG) input[3 + consumed] << 16) |
+                   ((ULONG) input[4 + consumed] << 8) |
+                   (ULONG) input[5 + consumed];
+  actual_adler = unison_adler32((const unsigned char *) String_val(output),
+                                output_length);
+  if (actual_adler != expected_adler) {
+    unison_confined_fail_handle("confinedInflateZlib rejected an Adler-32 checksum");
+  }
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, output);
+  Store_field(pair, 1, Val_int((int) (2 + consumed + 4)));
+  result = pair;
+  CAMLreturn(result);
 }
 
 CAMLprim value win_confined_open(value root, value components)

@@ -21,6 +21,8 @@ type dir_handle = System.dir_handle
                 = { readdir : unit -> string; closedir : unit -> unit }
 type confined_kind = System.confined_kind = ConfinedFile | ConfinedDirectory
 type confined_handle = System.confined_handle
+type confined_install = System.confined_install =
+  ConfinedInstalled | ConfinedAlreadyPresent
 
 let path p = Fspath.toString p |> System.extendedPath
 
@@ -56,6 +58,10 @@ let confinedKind = System.confinedKind
 let confinedRead = System.confinedRead
 let confinedList = System.confinedList
 let confinedClose = System.confinedClose
+let confinedEnsureDirectory = System.confinedEnsureDirectory
+let confinedOpenWritableDirectory = System.confinedOpenWritableDirectory
+let confinedInstall = System.confinedInstall
+let confinedInflateZlib = System.confinedInflateZlib
 
 let openfile f flags perms = System.openfile (path f) flags perms
 

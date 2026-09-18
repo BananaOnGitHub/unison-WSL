@@ -61,9 +61,9 @@ function Invoke-WorkspaceSync {
 function Invoke-NativeSelfTest {
     # This deliberately does not enable -wslworkspace.  The full upstream
     # self-test exercises ordinary Unison semantics, while the focused
-    # Gitrepo/Fs tests now included in it exercise the native confined-handle
-    # primitive against both disposable local roots, including this WSL UNC
-    # fixture.  Enabling the dedicated mode would intentionally hard-ignore
+    # Gitrepo/Gitobjects/Fs tests now included in it exercise the native
+    # confined-handle read/write primitive against both disposable local roots,
+    # including this WSL UNC fixture.  Enabling the dedicated mode would intentionally hard-ignore
     # .git and change unrelated upstream atomic-directory self-tests.
     $arguments = @(
         $windowsRoot,
