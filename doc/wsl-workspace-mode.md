@@ -27,6 +27,10 @@ unison `
 and `repeat=watch+N` are rejected because Windows filesystem notifications do
 not cover the WSL Plan 9 share reliably.
 
+`wslworkspace` is command-line-only. This lets Unison establish the trusted
+Windows configuration-directory guard before it opens the default profile or
+any included preference file.
+
 The mode rejects SSH/socket roots, relative roots, `\\wsl$`, drive roots,
 parent traversal, and configurations that do not contain exactly one local
 Windows path plus one `\\wsl.localhost\DISTRO\...` path.

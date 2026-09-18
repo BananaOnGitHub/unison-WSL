@@ -25,6 +25,9 @@ let rawPref default name =
 
 let profileName = ref None
 let profileFiles = ref []
+let profileReadSafetyCheck = ref (fun (_ : string) -> ())
+
+let setProfileReadSafetyCheck check = profileReadSafetyCheck := check
 
 let profilePathname ?(add_ext=true) n =
   let f = Util.fileInUnisonDir n in
@@ -380,6 +383,7 @@ let string2int name string =
    in the same order as in the file. *)
 let rec readAFile ?(fail=true) ?(add_ext=true) filename =
   let path = profilePathname ~add_ext:add_ext filename in
+  !profileReadSafetyCheck path;
   let locname =
     if add_ext then
       Printf.sprintf "Profile \"%s\" (file \"%s\")" filename path

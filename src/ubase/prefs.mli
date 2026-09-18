@@ -162,6 +162,10 @@ val profileUnchanged : unit -> bool
 (* Files that contributed preferences during the current profile load. *)
 val loadedProfileFiles : unit -> string list
 
+(* Install a check that runs before a profile or included preference file is
+   statted or opened. *)
+val setProfileReadSafetyCheck : (string -> unit) -> unit
+
 (* Add a new preference to the file on disk (the result is a diagnostic      *)
 (* message that can be displayed to the user to verify where the new pref    *)
 (* went)                                                                     *)

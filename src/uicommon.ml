@@ -835,6 +835,37 @@ let architecture =
 let wslWorkspaceFatal message =
   raise (Util.Fatal ("wslworkspace: " ^ message))
 
+let configureWslWorkspaceProfileGuard commandLineArgs =
+  Prefs.setProfileReadSafetyCheck (fun _ -> ());
+  let enabledOnCommandLine =
+    try
+      match Util.StringMap.find "wslworkspace" commandLineArgs with
+      | "true" :: _ -> true
+      | _ -> false
+    with Not_found -> false in
+  if enabledOnCommandLine then begin
+    if not Sys.win32 then
+      wslWorkspaceFatal "this mode must run in a native Windows build";
+    let configFspath = Fspath.canonize (Some Util.unisonDir) in
+    let configDir = Fspath.toString configFspath in
+    if Wslworkspace.classifyRoot configDir <> Wslworkspace.WindowsLocal then
+      wslWorkspaceFatal
+        "the Unison configuration and archive directory must be on a local Windows drive";
+    if Fs.isReparsePoint configFspath then
+      wslWorkspaceFatal
+        "the Unison configuration and archive directory must not be a reparse point";
+    Prefs.setProfileReadSafetyCheck (fun filename ->
+      let filename = Fspath.canonize (Some filename) in
+      let filenameString = Fspath.toString filename in
+      if not (Wslworkspace.isWithin ~root:configDir filenameString) then
+        wslWorkspaceFatal
+          ("refusing to read a preference file outside the trusted Windows "
+           ^ "configuration directory: " ^ filenameString);
+      if Fs.isReparsePoint filename then
+        wslWorkspaceFatal
+          ("preference file must not be a reparse point: " ^ filenameString))
+  end
+
 let prepareWslWorkspacePrefs () =
   if Prefs.read Wslworkspace.enabled then begin
     if not Sys.win32 then
@@ -846,7 +877,7 @@ let prepareWslWorkspacePrefs () =
     if Pred.extern Path.followPred <> [] then
       wslWorkspaceFatal
         "the 'follow' preference is forbidden because it can escape a replica root";
-    if Pred.extern Globals.merge <> [] then
+    if Globals.hasMergeRules () then
       wslWorkspaceFatal
         "the 'merge' preference is forbidden; conflicts must remain explicit";
     begin match Prefs.read repeat with
@@ -1090,8 +1121,10 @@ let initPrefs ~profileName ~promptForRoots ?(prepDebug = fun () -> ()) () =
   Prefs.profileName := Some(profileName);
 
   (* Check whether the -selftest flag is present on the command line *)
+  let commandLineArgs = Prefs.scanCmdLine usageMsg in
   let testFlagPresent =
-    Util.StringMap.mem runTestsPrefName (Prefs.scanCmdLine usageMsg) in
+    Util.StringMap.mem runTestsPrefName commandLineArgs in
+  configureWslWorkspaceProfileGuard commandLineArgs;
 
   (* If the -selftest flag is present, then we skip loading the preference file.
      (This is prevents possible confusions where settings from a preference

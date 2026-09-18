@@ -305,6 +305,8 @@ let merge =
 
 let shouldMerge p = Pred.test merge (Path.toString p)
 
+let hasMergeRules () = Pred.extern merge <> []
+
 let mergeCmdForPath p = Pred.assoc merge (Path.toString p)
 
 let someHostIsRunningWindows =

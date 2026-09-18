@@ -78,6 +78,7 @@ val confirmBigDeletes : bool Prefs.t
 (* Predicates on paths *)
 val shouldIgnore : 'a Path.path -> bool
 val shouldMerge : 'a Path.path -> bool
+val hasMergeRules : unit -> bool
 val ignorePred : Pred.t
 val ignorenotPred : Pred.t
 val atomic : Pred.t

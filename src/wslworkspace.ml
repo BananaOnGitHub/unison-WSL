@@ -4,6 +4,7 @@
 let enabled =
   Prefs.createBool "wslworkspace" false
     ~category:(`Advanced `Syncprocess)
+    ~cli_only:true
     ~local:true
     "enable the confined Windows-to-WSL workspace mode"
     ("This mode is intended for a native Windows Unison process synchronizing "
