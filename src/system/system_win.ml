@@ -75,6 +75,17 @@ external confined_install_impl : confined_handle -> string -> string -> int =
   "win_confined_install"
 external confined_inflate_zlib_impl : string -> int -> int -> string * int =
   "win_confined_inflate_zlib"
+external confined_open_mutation_impl : string -> string list -> confined_handle option =
+  "win_confined_open_mutation"
+external confined_open_mutation_directory_impl : confined_handle -> string -> confined_handle option =
+  "win_confined_open_mutation_directory"
+external confined_ensure_mutation_directory_impl : confined_handle -> string -> confined_handle =
+  "win_confined_ensure_mutation_directory"
+external confined_cas_replace_impl :
+  confined_handle -> string -> string option -> string -> int =
+  "win_confined_cas_replace"
+external confined_cas_delete_impl : confined_handle -> string -> string -> int =
+  "win_confined_cas_delete"
 
 let confinedOpen = confined_open_impl
 let confinedOpenChild = confined_open_child_impl
@@ -94,6 +105,18 @@ let confinedInstall directory name contents =
   | 1 -> ConfinedAlreadyPresent
   | _ -> invalid_arg "invalid confined install result"
 let confinedInflateZlib = confined_inflate_zlib_impl
+let confinedOpenMutation = confined_open_mutation_impl
+let confinedOpenMutationDirectory = confined_open_mutation_directory_impl
+let confinedEnsureMutationDirectory = confined_ensure_mutation_directory_impl
+let confinedCasResult = function
+  | 0 -> ConfinedChanged
+  | 1 -> ConfinedMismatch
+  | 2 -> ConfinedBusy
+  | _ -> invalid_arg "invalid confined compare-and-swap result"
+let confinedCasReplace directory name expected contents =
+  confinedCasResult (confined_cas_replace_impl directory name expected contents)
+let confinedCasDelete directory name expected =
+  confinedCasResult (confined_cas_delete_impl directory name expected)
 
 let rename f1 f2 =
   let rename_with_readonly_fix () =

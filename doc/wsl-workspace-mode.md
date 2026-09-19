@@ -139,7 +139,76 @@ in-place writes while a snapshot is being collected, or replace a valid object
 after this library releases its handle. Hash and checksum verification catches
 changed content during this operation, and all path/reparse replacement races
 on reads and writes fail closed, but cross-object snapshot consistency and
-quiescence are deferred to the later Git/ref transaction milestone.
+full multi-file transaction integration remain deferred.
+
+### Durable ref and HEAD mutation
+
+The branch now has a separate, standalone `Gitrefs.apply` operation that
+applies one direction of an already-reconciled `Gitstate` entry list to an
+**existing** repository. It does not perform reconciliation itself, and it is
+still not called from a normal Unison run. Its ordering is intentionally:
+
+1. inspect the repository and verify every selected plan entry has the exact
+   expected logical value;
+2. validate the complete desired object closure in the destination with the
+   same confined loose/pack decoder used for object transfer;
+3. open `.git` and each changed ref directory with a short Windows mutation
+   lease, then reject any busy Git state seen through those retained handles;
+4. compare the exact current `HEAD`, loose-ref, or `packed-refs` bytes through
+   a no-reparse file handle and publish only when that comparison still holds.
+
+The Windows primitive creates the ordinary sibling `name.lock` under the
+already-confined parent, flushes it, and publishes it with a handle-relative
+`NtSetInformationFile` rename. For an expected-present file, the current file
+is opened with no-follow semantics, byte-range locked before comparison, and
+kept protected from new write opens through publication. The retained mutation
+directory denies other writers the directory operations needed to create a Git
+lock, rename, or replace a child. Expected-absent creation instead uses a
+no-replace final rename, so a racing creator produces a mismatch rather than
+being overwritten. Deletes first byte-check the already-open ref and then
+delete that handle; temporary lock files are deleted on all ordinary failure
+paths. Every handle is validated as an ordinary file or directory and every
+reparse tag is rejected.
+
+Only supported direct durable refs are mutated. `HEAD` may be either a direct
+object ID or `ref: refs/...`; symbolic non-HEAD refs, gitfiles, linked
+worktrees, and deletion of `HEAD` remain unsupported. Before publishing a
+direct object ID, `Gitobjects.validateSnapshot` verifies its complete
+commit/tree/blob/tag closure (including packed and delta decoding) in the
+destination object store. Existence of an `objects/...` filename alone is not
+accepted as proof. This proves the closure immediately before metadata
+publication; the standalone layer deliberately does not hold an object-store
+transaction or pin object files after validation. Thus an adversarial actor
+can still make a subsequently referenced object unusable by changing it after
+validation, but cannot turn the operation into a path escape, arbitrary read,
+or write outside the confined repository.
+
+Packed refs are parsed strictly before a rewrite. Valid but non-reconciled
+entries, such as a remote-tracking ref, are preserved verbatim. Unknown header
+flags, malformed direct or peeled lines, duplicate refs, mixed SHA formats,
+and unrepresentable data fail closed. Updating a packed ref normally creates a
+loose shadow, which is Git's normal storage behavior and preserves the packed
+file. Deleting a ref that is packed first rewrites (or, if empty, removes)
+`packed-refs` through the same compare-and-swap primitive, then deletes any
+loose shadow. This order prevents an obsolete packed value from being revealed
+by the loose deletion.
+
+This operation deliberately makes no all-or-nothing claim across several
+refs, `packed-refs`, and `HEAD`. Each individual file mutation is a confined
+compare-and-swap: concurrent changes fail rather than being silently
+overwritten. A failure after an earlier successful mutation can leave a prefix
+of the reconciled durable state applied; for packed deletion, the packed entry
+may be removed while a still-present loose shadow preserves the old logical
+value. Later main-transaction integration must provide the broader recovery
+and user-visible transaction policy. Reflogs, indexes, hooks, config,
+operation scratch, and working-tree checkout remain untouched.
+
+The Windows lease blocks normal new Git/file-system write opens while it is
+held, and the byte-range lock protects the checked ref file. It cannot revoke
+an arbitrary actor's already-open directory or file handle. Such a handle is
+outside the standard Git lock protocol and is an unavoidable residual of a
+standalone Windows filesystem primitive; later transaction integration still
+needs a quiescence and recovery policy for that hostile-concurrency case.
 
 The branch remains limited to disposable fixtures until this library is wired
 into the later Git/ref transaction. Do not point it at the real workspace.
@@ -200,14 +269,14 @@ either workspace is used as synchronizer control state.
 
 This is the target transaction boundary. The branch currently contains the
 Git ref reconciler, safe read-only repository inspection, handle-confined
-immutable-object transfer, and trusted-state archive; none is wired into a
-synchronization run yet.
+immutable-object transfer/validation, standalone confined ref/HEAD mutation,
+and the trusted-state archive; none is wired into a synchronization run yet.
 
 | Category | Treatment |
 | --- | --- |
 | Ordinary working files | Existing Unison archive/reconciliation; byte-exact |
-| Git objects | Validated immutable closure union; no ref mutation or deletion |
-| `HEAD` and durable refs | Windows-side three-way Git-state archive; conflicts fail closed |
+| Git objects | Validated immutable closure union; standalone validation/transfer only |
+| `HEAD` and durable refs | Windows-side three-way Git-state archive; standalone confined CAS mutation; not yet in a Unison transaction |
 | Index, reflogs, hooks, config, locks, operation scratch | Replica-local; never propagated as shared state |
 | Synchronizer state and diagnostics | Trusted Windows-side state directory only |
 
@@ -243,7 +312,13 @@ It also transfers a fixed loose commit/tree/blob closure, a verified v2 packed
 commit graph, and a SHA-256 loose object without invoking Git. Focused fixtures
 cover already-present objects, malformed/truncated loose data, alternates,
 invalid object identifiers, retained-source-handle replacement, destination
-directory/final-name reparse races, and temporary-file cleanup.
+directory/final-name reparse races, and temporary-file cleanup. The ref tests
+then compose inspection, existing `Gitstate` reconciliation, object transfer,
+and standalone ref/HEAD mutation; they cover creation, update, deletion,
+detached/symbolic `HEAD`, loose shadows, packed deletion, stale-plan and
+expected-absent races, busy repositories, malformed packed refs, invalid
+object closures, reparse targets, and lock cleanup. The index and work tree
+are checked to remain unchanged.
 
 Only after those pass should clean real replicas be established from a chosen
 source of truth and synchronized for the first time.

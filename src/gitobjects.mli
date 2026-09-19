@@ -10,6 +10,16 @@ type report = {
   pack_files_installed : int;
 }
 
+(* [validateSnapshot ~repository snapshot] proves, using the same confined
+ * loose/pack decoder as [transfer], that every object reachable from
+ * [snapshot] is already present and valid in [repository].  It performs no
+ * writes and does not inspect refs beyond the ordinary repository readiness
+ * check.  Ref publication uses this before exposing a direct object ID. *)
+val validateSnapshot :
+  repository:Fspath.t ->
+  Gitstate.snapshot ->
+  (int, string) result
+
 (* [transfer ~source ~destination snapshot] makes every object reachable from
    [snapshot]'s supported refs and HEAD available in [destination]'s existing
    object database.  No ref or repository-visible state is moved. *)

@@ -122,7 +122,7 @@ let componentValid component =
   && checkRefChars component = None
   && checkForbiddenSequences component = None
 
-let isSupportedRefName name =
+let isValidRefName name =
   (* Must start with "refs/" *)
   startsWith name "refs/" &&
   (* Full-name forbidden-sequence check *)
@@ -133,7 +133,10 @@ let isSupportedRefName name =
   name.[String.length name - 1] <> '/' &&
   (* All slash-delimited components must be valid *)
   (let components = String.split_on_char '/' name in
-   List.for_all componentValid components) &&
+   List.for_all componentValid components)
+
+let isSupportedRefName name =
+  isValidRefName name &&
   (* Subset restrictions: namespaces not safe to reconcile here *)
   not (startsWith name "refs/bisect/") &&
   not (startsWith name "refs/original/") &&

@@ -570,10 +570,11 @@ typedef struct _UNISON_FILE_DISPOSITION_INFORMATION {
   BOOLEAN DeleteFile;
 } UNISON_FILE_DISPOSITION_INFORMATION, *PUNISON_FILE_DISPOSITION_INFORMATION;
 
-static NTSTATUS unison_confined_nt_create(
+static NTSTATUS unison_confined_nt_create_with_share(
   HANDLE root,
   PUNISON_UNICODE_STRING name,
   ACCESS_MASK desired_access,
+  ULONG share_access,
   ULONG disposition,
   ULONG create_options,
   HANDLE *opened)
@@ -595,11 +596,25 @@ static NTSTATUS unison_confined_nt_create(
     &io_status,
     NULL,
     FILE_ATTRIBUTE_NORMAL,
-    FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+    share_access,
     disposition,
     create_options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
     NULL,
     0);
+}
+
+static NTSTATUS unison_confined_nt_create(
+  HANDLE root,
+  PUNISON_UNICODE_STRING name,
+  ACCESS_MASK desired_access,
+  ULONG disposition,
+  ULONG create_options,
+  HANDLE *opened)
+{
+  return unison_confined_nt_create_with_share(
+    root, name, desired_access,
+    FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+    disposition, create_options, opened);
 }
 
 static NTSTATUS unison_confined_nt_open(
@@ -691,10 +706,10 @@ static void unison_confined_fail_handle(const char *operation)
   caml_failwith(operation);
 }
 
-static value unison_confined_alloc(HANDLE handle, int kind)
+static value unison_confined_alloc_handle(HANDLE handle, int kind)
 {
   CAMLparam0();
-  CAMLlocal2(result, option);
+  CAMLlocal1(result);
   unison_confined_handle *confined;
 
   result = caml_alloc_custom(&unison_confined_handle_ops,
@@ -702,6 +717,15 @@ static value unison_confined_alloc(HANDLE handle, int kind)
   confined = (unison_confined_handle *) Data_custom_val(result);
   confined->handle = handle;
   confined->kind = kind;
+  CAMLreturn(result);
+}
+
+static value unison_confined_alloc(HANDLE handle, int kind)
+{
+  CAMLparam0();
+  CAMLlocal2(result, option);
+
+  result = unison_confined_alloc_handle(handle, kind);
   option = caml_alloc(1, 0);
   Store_field(option, 0, result);
   CAMLreturn(option);
@@ -720,6 +744,14 @@ static int unison_confined_handle_from_value(value handle_value,
 #define UNISON_CONFINED_WRITE_DIRECTORY_ACCESS \
   (FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE)
 
+/* A ref mutation takes a short lease on each directory it changes.  The
+ * handle has the rights needed for the operation, but its sharing mode allows
+ * only readers.  That blocks a concurrent Git lock/rename in the same
+ * directory while the compare-and-swap primitive owns it. */
+#define UNISON_CONFINED_MUTATION_DIRECTORY_ACCESS \
+  (FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | \
+   FILE_DELETE_CHILD | SYNCHRONIZE)
+
 static NTSTATUS unison_confined_open_directory_access(
   unison_confined_handle *parent_handle, value name, ACCESS_MASK access,
   HANDLE *opened)
@@ -737,6 +769,114 @@ static NTSTATUS unison_confined_open_directory_access(
     FILE_DIRECTORY_FILE, opened);
   caml_stat_free(wide_name);
   return status;
+}
+
+static NTSTATUS unison_confined_open_mutation_directory_access(
+  HANDLE parent, PUNISON_UNICODE_STRING name, ULONG disposition,
+  HANDLE *opened)
+{
+  return unison_confined_nt_create_with_share(
+    parent, name, UNISON_CONFINED_MUTATION_DIRECTORY_ACCESS,
+    FILE_SHARE_READ, disposition, FILE_DIRECTORY_FILE, opened);
+}
+
+static NTSTATUS unison_confined_open_mutation_directory_value(
+  unison_confined_handle *parent_handle, value name, ULONG disposition,
+  HANDLE *opened)
+{
+  wchar_t *wide_name;
+  UNISON_UNICODE_STRING name_string;
+  NTSTATUS status;
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_open_mutation_directory_access(
+    parent_handle->handle, &name_string, disposition, opened);
+  caml_stat_free(wide_name);
+  return status;
+}
+
+static value unison_confined_finish_mutation_directory(
+  HANDLE child, const char *operation, value name)
+{
+  int kind;
+  DWORD error;
+  if (!unison_confined_validate_handle(child, &kind, &error)) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(error, operation, name);
+  }
+  if (kind != UNISON_CONFINED_DIRECTORY) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(ERROR_DIRECTORY, operation, name);
+  }
+  return unison_confined_alloc(child, kind);
+}
+
+CAMLprim value win_confined_open_mutation_directory(value parent, value name)
+{
+  unison_confined_handle *parent_handle;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  CAMLparam2(parent, name);
+
+  if (!unison_confined_handle_from_value(parent, &parent_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (parent_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpenMutationDirectory", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+  status = unison_confined_open_mutation_directory_value(
+    parent_handle, name, FILE_OPEN, &child);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+    unison_confined_raise_nt(status, "confinedOpenMutationDirectory", name);
+  }
+  CAMLreturn(unison_confined_finish_mutation_directory(
+    child, "confinedOpenMutationDirectory", name));
+}
+
+CAMLprim value win_confined_ensure_mutation_directory(value parent, value name)
+{
+  unison_confined_handle *parent_handle;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  int kind;
+  DWORD error;
+  CAMLparam2(parent, name);
+
+  if (!unison_confined_handle_from_value(parent, &parent_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (parent_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedEnsureMutationDirectory", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+  status = unison_confined_open_mutation_directory_value(
+    parent_handle, name, FILE_CREATE, &child);
+  if (status == STATUS_OBJECT_NAME_COLLISION) {
+    status = unison_confined_open_mutation_directory_value(
+      parent_handle, name, FILE_OPEN, &child);
+  }
+  if (!NT_SUCCESS(status)) {
+    unison_confined_raise_nt(status, "confinedEnsureMutationDirectory", name);
+  }
+  if (!unison_confined_validate_handle(child, &kind, &error)) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(error, "confinedEnsureMutationDirectory", name);
+  }
+  if (kind != UNISON_CONFINED_DIRECTORY) {
+    (void) CloseHandle(child);
+    unison_confined_raise_win(ERROR_DIRECTORY,
+                              "confinedEnsureMutationDirectory", name);
+  }
+  CAMLreturn(unison_confined_alloc_handle(child, kind));
 }
 
 CAMLprim value win_confined_open_writable_directory(value parent, value name)
@@ -820,7 +960,7 @@ CAMLprim value win_confined_ensure_directory(value parent, value name)
     unison_confined_raise_win(ERROR_DIRECTORY,
                               "confinedEnsureDirectory", name);
   }
-  CAMLreturn(unison_confined_alloc(child, kind));
+  CAMLreturn(unison_confined_alloc_handle(child, kind));
 }
 
 static LONG unison_confined_temp_counter = 0;
@@ -842,7 +982,7 @@ static int unison_confined_write_all(HANDLE handle, const char *contents,
 }
 
 static NTSTATUS unison_confined_publish(HANDLE staged, HANDLE directory,
-                                        value name)
+                                        value name, BOOLEAN replace)
 {
   wchar_t *wide_name;
   size_t name_bytes;
@@ -856,7 +996,7 @@ static NTSTATUS unison_confined_publish(HANDLE staged, HANDLE directory,
   information_size = offsetof(UNISON_FILE_RENAME_INFORMATION, FileName) +
                      name_bytes;
   information = caml_stat_alloc(information_size);
-  information->ReplaceIfExists = FALSE;
+  information->ReplaceIfExists = replace;
   information->RootDirectory = directory;
   information->FileNameLength = (ULONG) name_bytes;
   memcpy(information->FileName, wide_name, name_bytes);
@@ -934,7 +1074,7 @@ CAMLprim value win_confined_install(value directory, value name, value contents)
     unison_confined_raise_win(error, "confinedInstall", name);
   }
 
-  status = unison_confined_publish(staged, directory_handle->handle, name);
+  status = unison_confined_publish(staged, directory_handle->handle, name, FALSE);
   if (status == STATUS_OBJECT_NAME_COLLISION) {
     (void) unison_confined_delete_handle(staged);
     (void) CloseHandle(staged);
@@ -947,6 +1087,384 @@ CAMLprim value win_confined_install(value directory, value name, value contents)
   }
   (void) CloseHandle(staged);
   CAMLreturn(Val_int(0));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Confined Git ref compare-and-swap                                         */
+
+/* These operations intentionally use Git's ordinary [name.lock] convention.
+ * Unlike a pathname-level lockfile protocol, however, both the lock creation
+ * and final rename are relative to the retained directory handle.  The
+ * directory handle excludes peer writers, while the current ref handle holds
+ * a whole-file lock and denies new write opens while its exact bytes are
+ * compared. */
+
+#define UNISON_CAS_CHANGED 0
+#define UNISON_CAS_MISMATCH 1
+#define UNISON_CAS_BUSY 2
+
+static int unison_confined_busy_status(NTSTATUS status)
+{
+  return status == ((NTSTATUS)0xC0000043L) || /* STATUS_SHARING_VIOLATION */
+         status == ((NTSTATUS)0xC0000056L);   /* STATUS_DELETE_PENDING */
+}
+
+static wchar_t *unison_confined_lock_name(value name)
+{
+  mlsize_t length = caml_string_length(name);
+  char *bytes;
+  wchar_t *wide;
+
+  if (length > 240) {
+    caml_invalid_argument("confined ref name is too long for a lock file");
+  }
+  bytes = caml_stat_alloc(length + 6);
+  memcpy(bytes, String_val(name), length);
+  memcpy(bytes + length, ".lock", 6);
+  wide = caml_stat_strdup_to_utf16(bytes);
+  caml_stat_free(bytes);
+  return wide;
+}
+
+static NTSTATUS unison_confined_create_ref_lock(
+  unison_confined_handle *directory_handle, value name, HANDLE *staged)
+{
+  wchar_t *wide_name = unison_confined_lock_name(name);
+  UNISON_UNICODE_STRING name_string;
+  NTSTATUS status;
+
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_nt_create_with_share(
+    directory_handle->handle, &name_string,
+    FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES |
+      DELETE | SYNCHRONIZE,
+    FILE_SHARE_READ, FILE_CREATE, FILE_NON_DIRECTORY_FILE, staged);
+  caml_stat_free(wide_name);
+  return status;
+}
+
+static int unison_confined_ref_lock_valid(HANDLE staged, DWORD *error)
+{
+  int kind;
+  if (!unison_confined_validate_handle(staged, &kind, error)) return 0;
+  if (kind != UNISON_CONFINED_FILE) {
+    *error = ERROR_CANT_ACCESS_FILE;
+    return 0;
+  }
+  return 1;
+}
+
+static void unison_confined_cleanup_staged(HANDLE staged)
+{
+  if (staged != INVALID_HANDLE_VALUE) {
+    (void) unison_confined_delete_handle(staged);
+    (void) CloseHandle(staged);
+  }
+}
+
+static int unison_confined_lock_ref(HANDLE handle)
+{
+  OVERLAPPED overlap;
+  ZeroMemory(&overlap, sizeof overlap);
+  return LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0, MAXDWORD, MAXDWORD, &overlap) != 0;
+}
+
+static void unison_confined_unlock_ref(HANDLE handle)
+{
+  OVERLAPPED overlap;
+  ZeroMemory(&overlap, sizeof overlap);
+  (void) UnlockFileEx(handle, 0, MAXDWORD, MAXDWORD, &overlap);
+}
+
+static int unison_confined_contents_match(HANDLE handle, value expected,
+                                          DWORD *error)
+{
+  LARGE_INTEGER size;
+  mlsize_t length = caml_string_length(expected);
+  mlsize_t offset = 0;
+
+  if (!GetFileSizeEx(handle, &size)) {
+    *error = GetLastError();
+    return -1;
+  }
+  if (size.QuadPart < 0 || (ULONGLONG) size.QuadPart != (ULONGLONG) length) {
+    return 0;
+  }
+  while (offset < length) {
+    char buffer[65536];
+    DWORD read = 0;
+    DWORD requested = (DWORD) min((mlsize_t) sizeof buffer, length - offset);
+    if (!ReadFile(handle, buffer, requested, &read, NULL) || read != requested) {
+      *error = GetLastError();
+      if (*error == ERROR_SUCCESS) *error = ERROR_READ_FAULT;
+      return -1;
+    }
+    if (memcmp(buffer, String_val(expected) + offset, read) != 0) return 0;
+    offset += read;
+  }
+  if (!GetFileSizeEx(handle, &size)) {
+    *error = GetLastError();
+    return -1;
+  }
+  if (size.QuadPart < 0 || (ULONGLONG) size.QuadPart != (ULONGLONG) length) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Open a current ref without following a reparse point.  [expected] is
+ * compared only after an exclusive byte-range lock has been acquired, so a
+ * pre-existing write handle cannot change the bytes between comparison and
+ * publication. */
+static int unison_confined_open_expected_ref(
+  unison_confined_handle *directory_handle, value name, value expected,
+  HANDLE *current, DWORD *error)
+{
+  wchar_t *wide_name;
+  UNISON_UNICODE_STRING name_string;
+  NTSTATUS status;
+  int kind;
+  int matches;
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_nt_create_with_share(
+    directory_handle->handle, &name_string,
+    FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+    FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_OPEN, FILE_NON_DIRECTORY_FILE,
+    current);
+  caml_stat_free(wide_name);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_missing(status)) return UNISON_CAS_MISMATCH;
+    if (unison_confined_busy_status(status)) return UNISON_CAS_BUSY;
+    *error = pRtlNtStatusToDosError(status);
+    return -1;
+  }
+  if (!unison_confined_validate_handle(*current, &kind, error)) {
+    (void) CloseHandle(*current);
+    *current = INVALID_HANDLE_VALUE;
+    return -1;
+  }
+  if (kind != UNISON_CONFINED_FILE) {
+    (void) CloseHandle(*current);
+    *current = INVALID_HANDLE_VALUE;
+    *error = ERROR_CANT_ACCESS_FILE;
+    return -1;
+  }
+  if (!unison_confined_lock_ref(*current)) {
+    (void) CloseHandle(*current);
+    *current = INVALID_HANDLE_VALUE;
+    return UNISON_CAS_BUSY;
+  }
+  matches = unison_confined_contents_match(*current, expected, error);
+  if (matches < 0) {
+    unison_confined_unlock_ref(*current);
+    (void) CloseHandle(*current);
+    *current = INVALID_HANDLE_VALUE;
+    return -1;
+  }
+  if (matches == 0) {
+    unison_confined_unlock_ref(*current);
+    (void) CloseHandle(*current);
+    *current = INVALID_HANDLE_VALUE;
+    return UNISON_CAS_MISMATCH;
+  }
+  return UNISON_CAS_CHANGED;
+}
+
+/* [None] means that the target must be absent.  It is probed only after the
+ * handle-relative lock has been created; a successful creation uses a
+ * no-replace rename, so a late creator can never be overwritten. */
+static int unison_confined_require_absent_ref(
+  unison_confined_handle *directory_handle, value name, DWORD *error)
+{
+  wchar_t *wide_name;
+  UNISON_UNICODE_STRING name_string;
+  HANDLE current = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  int kind;
+
+  wide_name = caml_stat_strdup_to_utf16(String_val(name));
+  name_string.Buffer = wide_name;
+  name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+  name_string.MaximumLength = name_string.Length;
+  status = unison_confined_nt_create_with_share(
+    directory_handle->handle, &name_string,
+    FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+    FILE_OPEN, FILE_NON_DIRECTORY_FILE, &current);
+  caml_stat_free(wide_name);
+  if (unison_confined_missing(status)) return UNISON_CAS_CHANGED;
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_busy_status(status)) return UNISON_CAS_BUSY;
+    *error = pRtlNtStatusToDosError(status);
+    return -1;
+  }
+  if (!unison_confined_validate_handle(current, &kind, error)) {
+    (void) CloseHandle(current);
+    return -1;
+  }
+  (void) CloseHandle(current);
+  if (kind != UNISON_CONFINED_FILE) {
+    *error = ERROR_CANT_ACCESS_FILE;
+    return -1;
+  }
+  return UNISON_CAS_MISMATCH;
+}
+
+CAMLprim value win_confined_cas_replace(value directory, value name,
+                                        value expected, value contents)
+{
+  unison_confined_handle *directory_handle;
+  HANDLE staged = INVALID_HANDLE_VALUE;
+  HANDLE current = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  DWORD error = ERROR_SUCCESS;
+  int result;
+  int replace;
+  CAMLparam4(directory, name, expected, contents);
+
+  win_init();
+  if (!nt_confined_api_available) {
+    unison_confined_raise_win(ERROR_NOT_SUPPORTED, "confinedCasReplace", name);
+  }
+  if (!unison_confined_handle_from_value(directory, &directory_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (directory_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedCasReplace", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+
+  status = unison_confined_create_ref_lock(directory_handle, name, &staged);
+  if (status == STATUS_OBJECT_NAME_COLLISION) CAMLreturn(Val_int(UNISON_CAS_BUSY));
+  if (unison_confined_busy_status(status)) CAMLreturn(Val_int(UNISON_CAS_BUSY));
+  if (!NT_SUCCESS(status)) {
+    unison_confined_raise_nt(status, "confinedCasReplace", name);
+  }
+  if (!unison_confined_ref_lock_valid(staged, &error)) {
+    unison_confined_cleanup_staged(staged);
+    unison_confined_raise_win(error, "confinedCasReplace", name);
+  }
+
+  if (Is_block(expected)) {
+    result = unison_confined_open_expected_ref(
+      directory_handle, name, Field(expected, 0), &current, &error);
+    replace = TRUE;
+  } else {
+    result = unison_confined_require_absent_ref(directory_handle, name, &error);
+    replace = FALSE;
+  }
+  if (result == UNISON_CAS_MISMATCH || result == UNISON_CAS_BUSY) {
+    unison_confined_cleanup_staged(staged);
+    CAMLreturn(Val_int(result));
+  }
+  if (result < 0) {
+    unison_confined_cleanup_staged(staged);
+    unison_confined_raise_win(error, "confinedCasReplace", name);
+  }
+  if (!unison_confined_write_all(staged, String_val(contents),
+                                 caml_string_length(contents))) {
+    error = GetLastError();
+    if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
+    if (current != INVALID_HANDLE_VALUE) {
+      unison_confined_unlock_ref(current);
+      (void) CloseHandle(current);
+    }
+    unison_confined_cleanup_staged(staged);
+    unison_confined_raise_win(error, "confinedCasReplace", name);
+  }
+  status = unison_confined_publish(staged, directory_handle->handle, name,
+                                   (BOOLEAN) replace);
+  if (!NT_SUCCESS(status)) {
+    if (current != INVALID_HANDLE_VALUE) {
+      unison_confined_unlock_ref(current);
+      (void) CloseHandle(current);
+    }
+    unison_confined_cleanup_staged(staged);
+    if (status == STATUS_OBJECT_NAME_COLLISION) {
+      CAMLreturn(Val_int(UNISON_CAS_MISMATCH));
+    }
+    if (unison_confined_busy_status(status)) CAMLreturn(Val_int(UNISON_CAS_BUSY));
+    unison_confined_raise_nt(status, "confinedCasReplace", name);
+  }
+  if (current != INVALID_HANDLE_VALUE) {
+    unison_confined_unlock_ref(current);
+    (void) CloseHandle(current);
+  }
+  (void) CloseHandle(staged);
+  CAMLreturn(Val_int(UNISON_CAS_CHANGED));
+}
+
+CAMLprim value win_confined_cas_delete(value directory, value name,
+                                       value expected)
+{
+  unison_confined_handle *directory_handle;
+  HANDLE staged = INVALID_HANDLE_VALUE;
+  HANDLE current = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  DWORD error = ERROR_SUCCESS;
+  int result;
+  CAMLparam3(directory, name, expected);
+
+  win_init();
+  if (!nt_confined_api_available) {
+    unison_confined_raise_win(ERROR_NOT_SUPPORTED, "confinedCasDelete", name);
+  }
+  if (!unison_confined_handle_from_value(directory, &directory_handle)) {
+    caml_invalid_argument("closed confined handle");
+  }
+  if (directory_handle->kind != UNISON_CONFINED_DIRECTORY) {
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedCasDelete", name);
+  }
+  if (!unison_confined_component_valid(name)) {
+    caml_invalid_argument("invalid confined path component");
+  }
+
+  status = unison_confined_create_ref_lock(directory_handle, name, &staged);
+  if (status == STATUS_OBJECT_NAME_COLLISION) CAMLreturn(Val_int(UNISON_CAS_BUSY));
+  if (unison_confined_busy_status(status)) CAMLreturn(Val_int(UNISON_CAS_BUSY));
+  if (!NT_SUCCESS(status)) {
+    unison_confined_raise_nt(status, "confinedCasDelete", name);
+  }
+  if (!unison_confined_ref_lock_valid(staged, &error)) {
+    unison_confined_cleanup_staged(staged);
+    unison_confined_raise_win(error, "confinedCasDelete", name);
+  }
+  result = unison_confined_open_expected_ref(
+    directory_handle, name, expected, &current, &error);
+  if (result == UNISON_CAS_MISMATCH || result == UNISON_CAS_BUSY) {
+    unison_confined_cleanup_staged(staged);
+    CAMLreturn(Val_int(result));
+  }
+  if (result < 0) {
+    unison_confined_cleanup_staged(staged);
+    unison_confined_raise_win(error, "confinedCasDelete", name);
+  }
+
+  /* Do not make the ref disappear if its lock cannot be removed. */
+  status = unison_confined_delete_handle(staged);
+  if (!NT_SUCCESS(status)) {
+    unison_confined_unlock_ref(current);
+    (void) CloseHandle(current);
+    (void) CloseHandle(staged);
+    unison_confined_raise_nt(status, "confinedCasDelete", name);
+  }
+  (void) CloseHandle(staged);
+  status = unison_confined_delete_handle(current);
+  unison_confined_unlock_ref(current);
+  (void) CloseHandle(current);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_busy_status(status)) CAMLreturn(Val_int(UNISON_CAS_BUSY));
+    unison_confined_raise_nt(status, "confinedCasDelete", name);
+  }
+  CAMLreturn(Val_int(UNISON_CAS_CHANGED));
 }
 
 static ULONG unison_adler32(const unsigned char *bytes, unsigned long length)
@@ -1116,6 +1634,85 @@ CAMLprim value win_confined_open(value root, value components)
     }
   }
 
+  CAMLreturn(unison_confined_alloc(current, kind));
+}
+
+/* Open a directory path for a short metadata mutation lease.  The trusted
+ * worktree root is still opened normally; every requested component is then
+ * opened relative to the preceding directory with reparse rejection and a
+ * share mode that excludes other writers. */
+CAMLprim value win_confined_open_mutation(value root, value components)
+{
+  HANDLE current = INVALID_HANDLE_VALUE;
+  HANDLE child = INVALID_HANDLE_VALUE;
+  NTSTATUS status;
+  UNISON_UNICODE_STRING root_name;
+  wchar_t *root_path;
+  value list;
+  int kind;
+  DWORD error;
+  CAMLparam2(root, components);
+
+  win_init();
+  if (!nt_confined_api_available) {
+    unison_confined_raise_win(ERROR_NOT_SUPPORTED, "confinedOpenMutation", root);
+  }
+  unison_confined_validate_components(components);
+  if (components == Val_emptylist) {
+    caml_invalid_argument("confinedOpenMutation requires a directory component");
+  }
+
+  root_path = caml_stat_strdup_to_utf16(String_val(root));
+  if (!pRtlDosPathNameToNtPathNameU(root_path, &root_name, NULL, NULL)) {
+    caml_stat_free(root_path);
+    unison_confined_raise_win(ERROR_INVALID_NAME, "confinedOpenMutation", root);
+  }
+  caml_stat_free(root_path);
+  status = unison_confined_nt_open(NULL, &root_name, FILE_DIRECTORY_FILE, &current);
+  pRtlFreeUnicodeString(&root_name);
+  if (!NT_SUCCESS(status)) {
+    if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+    unison_confined_raise_nt(status, "confinedOpenMutation", root);
+  }
+  if (!unison_confined_validate_handle(current, &kind, &error)) {
+    (void) CloseHandle(current);
+    unison_confined_raise_win(error, "confinedOpenMutation", root);
+  }
+  if (kind != UNISON_CONFINED_DIRECTORY) {
+    (void) CloseHandle(current);
+    unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpenMutation", root);
+  }
+
+  list = components;
+  while (Is_block(list)) {
+    value name = Field(list, 0);
+    wchar_t *wide_name = caml_stat_strdup_to_utf16(String_val(name));
+    UNISON_UNICODE_STRING name_string;
+
+    name_string.Buffer = wide_name;
+    name_string.Length = (USHORT) (wcslen(wide_name) * sizeof(WCHAR));
+    name_string.MaximumLength = name_string.Length;
+    status = unison_confined_open_mutation_directory_access(
+      current, &name_string, FILE_OPEN, &child);
+    caml_stat_free(wide_name);
+    if (!NT_SUCCESS(status)) {
+      (void) CloseHandle(current);
+      if (unison_confined_missing(status)) CAMLreturn(Val_int(0));
+      unison_confined_raise_nt(status, "confinedOpenMutation", name);
+    }
+    (void) CloseHandle(current);
+    current = child;
+    child = INVALID_HANDLE_VALUE;
+    if (!unison_confined_validate_handle(current, &kind, &error)) {
+      (void) CloseHandle(current);
+      unison_confined_raise_win(error, "confinedOpenMutation", name);
+    }
+    if (kind != UNISON_CONFINED_DIRECTORY) {
+      (void) CloseHandle(current);
+      unison_confined_raise_win(ERROR_DIRECTORY, "confinedOpenMutation", name);
+    }
+    list = Field(list, 1);
+  }
   CAMLreturn(unison_confined_alloc(current, kind));
 }
 

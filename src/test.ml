@@ -1103,6 +1103,220 @@ let test() =
         else Some "Git object transfer followed a replacement/reparse path or left a staged file"
     | Some (Common.Remote _, _) -> assert false) ;
 
+  (* ---------------------------------------------------------------------- *)
+  (* Focused durable Git ref/HEAD mutation fixtures.  These are deliberately
+     built from fixed object bytes, not a workspace Git executable.  They
+     exercise the standalone composition that a later Unison transaction will
+     call, while leaving indexes and working files entirely local. *)
+
+  let writeGitClosure repo =
+    writeGitObject repo gitBlobOid gitBlobLoose;
+    writeGitObject repo gitTreeOid gitTreeLoose;
+    writeGitObject repo gitCommitOid gitCommitLoose in
+
+  let writeGitRef repo name value =
+    let components = String.split_on_char '/' name in
+    let directory = ref (extend repo ".git") in
+    let rec descend = function
+      | [] -> failwith "invalid disposable Git ref"
+      | [leaf] -> write (extend !directory leaf) (value ^ "\n")
+      | component :: rest ->
+          directory := extend !directory component;
+          if not (Fs.file_exists !directory) then Fs.mkdir !directory default_perm;
+          descend rest in
+    descend components in
+
+  let gitCopyToRight name expected desired = {
+    Gitstate.name = name;
+    base = expected;
+    left = desired;
+    right = expected;
+    action = Gitstate.CopyLeftToRight desired;
+  } in
+
+  let applyGitRight repository entries =
+    Gitrefs.apply ~repository ~target:Gitrefs.Right entries in
+
+  check_assert "gitrefs composes transfer, reconciliation, and confined durable mutation" (fun () ->
+    if not Sys.win32 then None
+    else match r1, r2 with
+    | (Common.Local, sourceRoot), (Common.Local, destinationRoot) ->
+        let source = extend sourceRoot "git-ref-compose-source" in
+        let destination = extend destinationRoot "git-ref-compose-destination" in
+        writeGitSkeleton source gitCommitOid;
+        writeGitClosure source;
+        writeGitSkeleton destination gitBlobOid;
+        write (extend destination "workspace-sentinel") "work tree remains local\n";
+        write (extend destination ".git/index") "destination-local-index\n";
+        let sourceSnapshot = gitSnapshot source in
+        let destinationBefore = gitSnapshot destination in
+        let plan = Gitstate.reconcileSnapshot ~base:destinationBefore
+          ~left:sourceSnapshot ~right:destinationBefore in
+        begin match Gitobjects.transfer ~source ~destination sourceSnapshot with
+        | Error message -> Some ("object-transfer part of composition failed: " ^ message)
+        | Ok _ -> begin match applyGitRight destination plan with
+          | Error message -> Some ("ref-mutation part of composition failed: " ^ message)
+          | Ok report ->
+              begin match Gitrepo.inspect destination with
+              | Gitrepo.Ready snapshot
+                when snapshot = sourceSnapshot && report.refs_changed = 1 &&
+                     not report.head_changed &&
+                     read (extend destination ".git/index") = "destination-local-index\n" &&
+                     read (extend destination "workspace-sentinel") = "work tree remains local\n" -> None
+              | _ -> Some "Git object transfer plus ref mutation changed local index/worktree or missed durable state"
+              end
+          end
+        end
+    | _ -> Some "Git ref composition fixture requires two local roots") ;
+
+  check_assert "gitrefs creates, updates, deletes, and moves detached or symbolic HEAD" (fun () ->
+    if not Sys.win32 then None
+    else match r1 with
+    | Common.Local, root ->
+        let repo = extend root "git-ref-basic" in
+        writeGitSkeleton repo gitCommitOid;
+        writeGitClosure repo;
+        let absent = Gitstate.Absent
+        and blob = Gitstate.Present gitBlobOid
+        and tree = Gitstate.Present gitTreeOid
+        and commit = Gitstate.Present gitCommitOid in
+        let created = applyGitRight repo [gitCopyToRight "refs/heads/feature" absent commit] in
+        let updated = applyGitRight repo [gitCopyToRight "refs/heads/feature" commit tree] in
+        let deleted = applyGitRight repo [gitCopyToRight "refs/heads/feature" tree absent] in
+        write (extend repo ".git/HEAD") (gitBlobOid ^ "\n");
+        let detached = applyGitRight repo [gitCopyToRight "HEAD" blob commit] in
+        writeGitRef repo "refs/heads/old" gitBlobOid;
+        writeGitRef repo "refs/heads/new" gitCommitOid;
+        write (extend repo ".git/HEAD") "ref: refs/heads/old\n";
+        let symbolic = applyGitRight repo [gitCopyToRight "HEAD"
+          (Gitstate.Present "ref: refs/heads/old")
+          (Gitstate.Present "ref: refs/heads/new")] in
+        begin match created, updated, deleted, detached, symbolic, Gitrepo.inspect repo with
+        | Ok _, Ok _, Ok _, Ok detachedReport, Ok symbolicReport,
+          Gitrepo.Ready snapshot
+          when detachedReport.head_changed && symbolicReport.head_changed &&
+               snapshot.Gitstate.head = Gitstate.Present "ref: refs/heads/new" &&
+               not (List.mem_assoc "refs/heads/feature" snapshot.refs) &&
+               List.assoc "refs/heads/old" snapshot.refs = gitBlobOid &&
+               List.assoc "refs/heads/new" snapshot.refs = gitCommitOid -> None
+        | _ -> Some "Git ref creation/update/deletion or HEAD mutation did not preserve expected durable state"
+        end
+    | _ -> Some "Git basic mutation fixture requires a local root") ;
+
+  check_assert "gitrefs handles loose shadows and packed-ref deletion without resurrection" (fun () ->
+    if not Sys.win32 then None
+    else match r1 with
+    | Common.Local, root ->
+        let repo = extend root "git-ref-packed" in
+        writeGitSkeleton repo gitCommitOid;
+        writeGitClosure repo;
+        let packed =
+          "# pack-refs with: peeled fully-peeled sorted\n" ^
+          gitTreeOid ^ " refs/heads/main\n" ^
+          gitBlobOid ^ " refs/heads/delete-me\n" ^
+          gitCommitOid ^ " refs/heads/keep\n" ^
+          gitBlobOid ^ " refs/remotes/origin/main\n" in
+        write (extend repo ".git/packed-refs") packed;
+        (* Loose [main] shadows its older packed value. *)
+        writeGitRef repo "refs/heads/main" gitBlobOid;
+        let shadow = applyGitRight repo [gitCopyToRight "refs/heads/main"
+          (Gitstate.Present gitBlobOid) (Gitstate.Present gitCommitOid)] in
+        let removePacked = applyGitRight repo [gitCopyToRight "refs/heads/delete-me"
+          (Gitstate.Present gitBlobOid) Gitstate.Absent] in
+        let packedUpdate = extend root "git-ref-packed-update" in
+        writeGitSkeleton packedUpdate gitCommitOid;
+        writeGitClosure packedUpdate;
+        Fs.unlink (extend packedUpdate ".git/refs/heads/main");
+        write (extend packedUpdate ".git/packed-refs")
+          (gitBlobOid ^ " refs/heads/main\n");
+        let packedUpdated = applyGitRight packedUpdate [gitCopyToRight "refs/heads/main"
+          (Gitstate.Present gitBlobOid) (Gitstate.Present gitCommitOid)] in
+        let packedUpdateRaw = read (extend packedUpdate ".git/packed-refs") in
+        let raw = read (extend repo ".git/packed-refs") in
+        let packedNames = String.split_on_char '\n' raw in
+        begin match shadow, removePacked, packedUpdated, Gitrepo.inspect repo with
+        | Ok _, Ok report, Ok _, Gitrepo.Ready snapshot
+          when report.packed_refs_rewritten &&
+               List.assoc "refs/heads/main" snapshot.refs = gitCommitOid &&
+               not (List.mem_assoc "refs/heads/delete-me" snapshot.refs) &&
+               List.exists (fun line -> Util.endswith line " refs/heads/keep")
+                 packedNames &&
+               not (List.exists (fun line -> Util.endswith line " refs/heads/delete-me")
+                 packedNames) &&
+               List.exists (fun line -> Util.endswith line " refs/remotes/origin/main")
+                 packedNames &&
+               packedUpdateRaw = gitBlobOid ^ " refs/heads/main\n" &&
+               read (extend packedUpdate ".git/refs/heads/main") = gitCommitOid ^ "\n" -> None
+        | _ -> Some "packed-ref deletion revealed an obsolete value or lost unrelated refs"
+        end
+    | _ -> Some "Git packed-ref fixture requires a local root") ;
+
+  check_assert "gitrefs rejects stale, busy, malformed, missing, corrupt, and reparse mutations" (fun () ->
+    if not Sys.win32 then None
+    else match List.find_opt (function
+      | Common.Local, root ->
+          Wslworkspace.classifyRoot (Fspath.toString root) = Wslworkspace.WindowsLocal
+      | Common.Remote _, _ -> false) [r1; r2] with
+    | None -> Some "Git ref failure fixture requires a Windows local disposable root"
+    | Some (Common.Local, root) ->
+        let repo = extend root "git-ref-failures" in
+        writeGitSkeleton repo gitCommitOid;
+        writeGitClosure repo;
+        writeGitRef repo "refs/heads/raced" gitBlobOid;
+        let stale = gitCopyToRight "refs/heads/raced"
+          (Gitstate.Present gitBlobOid) (Gitstate.Present gitCommitOid) in
+        (* This is the post-inspection replacement: the plan still expects
+           [blob], but the current ref was changed before publication. *)
+        writeGitRef repo "refs/heads/raced" gitTreeOid;
+        let staleRejected = match applyGitRight repo [stale] with Error _ ->
+          read (extend repo ".git/refs/heads/raced") = gitTreeOid ^ "\n" | Ok _ -> false in
+        let absent = gitCopyToRight "refs/heads/created-race" Gitstate.Absent
+          (Gitstate.Present gitCommitOid) in
+        writeGitRef repo "refs/heads/created-race" gitBlobOid;
+        let absentRejected = match applyGitRight repo [absent] with Error _ ->
+          read (extend repo ".git/refs/heads/created-race") = gitBlobOid ^ "\n" | Ok _ -> false in
+        write (extend repo ".git/index.lock") "busy\n";
+        let busyRejected = match applyGitRight repo [stale] with Error _ -> true | Ok _ -> false in
+        Fs.unlink (extend repo ".git/index.lock");
+        write (extend repo ".git/packed-refs") "not a packed ref\n";
+        let malformedRejected = match applyGitRight repo
+          [gitCopyToRight "refs/heads/raced" (Gitstate.Present gitTreeOid)
+             (Gitstate.Present gitCommitOid)] with Error _ -> true | Ok _ -> false in
+        Fs.unlink (extend repo ".git/packed-refs");
+        let missing = extend root "git-ref-missing-object" in
+        writeGitSkeleton missing gitBlobOid;
+        let missingRejected = match applyGitRight missing
+          [gitCopyToRight "refs/heads/main" (Gitstate.Present gitBlobOid)
+             (Gitstate.Present gitCommitOid)] with Error _ -> true | Ok _ -> false in
+        let corrupt = extend root "git-ref-corrupt-object" in
+        writeGitSkeleton corrupt gitBlobOid;
+        writeGitObject corrupt gitBlobOid "not a zlib object";
+        let corruptRejected = match applyGitRight corrupt
+          [gitCopyToRight "refs/heads/main" (Gitstate.Present gitBlobOid)
+             (Gitstate.Present gitBlobOid)] with Error _ -> true | Ok _ -> false in
+        let outside = extend root "git-ref-reparse-outside" in
+        writefs outside (Dir ["outside", File "outside\n"]);
+        let reparse = extend repo ".git/refs/heads/reparse" in
+        Fs.symlink (Fspath.toString (extend outside "outside")) reparse;
+        let mutationDirectory = match Fs.confinedOpenMutation repo
+          [".git"; "refs"; "heads"] with
+          | Some handle -> handle
+          | None -> failwith "mutation fixture lost its parent directory" in
+        let reparseRejected =
+          try
+            ignore (Fs.confinedCasReplace mutationDirectory "reparse"
+              (Some "old\n") "new\n");
+            false
+          with _ -> true in
+        Fs.confinedClose mutationDirectory;
+        let noLockLeft = not (Fs.file_exists (extend repo ".git/refs/heads/reparse.lock")) in
+        if staleRejected && absentRejected && busyRejected && malformedRejected &&
+           missingRejected && corruptRejected && reparseRejected && noLockLeft &&
+           read (extend outside "outside") = "outside\n"
+        then None
+        else Some "Git ref mutation did not fail closed or clean its lock after a hostile fixture"
+    | Some (Common.Remote _, _) -> assert false) ;
+
   (* N.b.: When making up tests, it's important to choose file contents of different
      lengths.  The reason for this is that, on some Unix systems, it is possible for
      the inode number of a just-deleted file to be reassigned to the very next file

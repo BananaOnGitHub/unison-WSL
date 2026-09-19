@@ -551,6 +551,41 @@ gitrepo.cmx : \
 gitrepo.cmi : \
     gitstate.cmi \
     fspath.cmi
+gitobjects.cmo : \
+    ubase/util.cmi \
+    gitstate.cmi \
+    gitrepo.cmi \
+    fspath.cmi \
+    fs.cmi \
+    gitobjects.cmi
+gitobjects.cmx : \
+    ubase/util.cmx \
+    gitstate.cmx \
+    gitrepo.cmx \
+    fspath.cmx \
+    fs.cmx \
+    gitobjects.cmi
+gitobjects.cmi : \
+    gitstate.cmi \
+    fspath.cmi
+gitrefs.cmo : \
+    ubase/util.cmi \
+    gitstate.cmi \
+    gitrepo.cmi \
+    gitobjects.cmi \
+    fspath.cmi \
+    fs.cmi \
+    gitrefs.cmi
+gitrefs.cmx : \
+    ubase/util.cmx \
+    gitstate.cmx \
+    gitrepo.cmx \
+    gitobjects.cmx \
+    fspath.cmx \
+    fs.cmx \
+    gitrefs.cmi
+gitrefs.cmi : \
+    fspath.cmi
 gitstate.cmo : \
     gitstate.cmi
 gitstate.cmx : \
@@ -1156,6 +1191,8 @@ test.cmo : \
     globals.cmi \
     gitstate.cmi \
     gitrepo.cmi \
+    gitobjects.cmi \
+    gitrefs.cmi \
     gitarchive.cmi \
     fspath.cmi \
     fs.cmi \
@@ -1183,6 +1220,8 @@ test.cmx : \
     globals.cmx \
     gitstate.cmx \
     gitrepo.cmx \
+    gitobjects.cmx \
+    gitrefs.cmx \
     gitarchive.cmx \
     fspath.cmx \
     fs.cmx \

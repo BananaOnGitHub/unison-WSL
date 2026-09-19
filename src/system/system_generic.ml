@@ -35,6 +35,7 @@ type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
 
 type confined_kind = ConfinedFile | ConfinedDirectory
 type confined_install = ConfinedInstalled | ConfinedAlreadyPresent
+type confined_cas = ConfinedChanged | ConfinedMismatch | ConfinedBusy
 
 (* This fallback keeps the same handle-consuming API for non-Windows unit
  * tests.  It is deliberately not described as a confinement primitive: the
@@ -149,6 +150,21 @@ let confinedOpenWritableDirectory _ _ =
 
 let confinedInstall _ _ _ =
   raise (Unix.Unix_error (Unix.ENOSYS, "confinedInstall", ""))
+
+let confinedOpenMutation _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedOpenMutation", ""))
+
+let confinedOpenMutationDirectory _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedOpenMutationDirectory", ""))
+
+let confinedEnsureMutationDirectory _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedEnsureMutationDirectory", ""))
+
+let confinedCasReplace _ _ _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedCasReplace", ""))
+
+let confinedCasDelete _ _ _ =
+  raise (Unix.Unix_error (Unix.ENOSYS, "confinedCasDelete", ""))
 
 let confinedInflateZlib _ _ _ =
   raise (Unix.Unix_error (Unix.ENOSYS, "confinedInflateZlib", ""))

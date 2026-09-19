@@ -29,6 +29,7 @@ type dir_handle = { readdir : unit -> string; closedir : unit -> unit }
 type confined_kind = ConfinedFile | ConfinedDirectory
 type confined_handle
 type confined_install = ConfinedInstalled | ConfinedAlreadyPresent
+type confined_cas = ConfinedChanged | ConfinedMismatch | ConfinedBusy
 
 val symlink : string -> fspath -> unit
 val readlink : fspath -> string
@@ -63,6 +64,23 @@ val confinedClose : confined_handle -> unit
 val confinedEnsureDirectory : confined_handle -> string -> confined_handle
 val confinedOpenWritableDirectory : confined_handle -> string -> confined_handle option
 val confinedInstall : confined_handle -> string -> string -> confined_install
+
+(* Mutation handles are deliberately narrower than ordinary writable
+ * directories.  On Windows they retain a directory handle whose sharing mode
+ * prevents another writer from creating, removing, or replacing children
+ * while a confined Git metadata compare-and-swap is in progress. *)
+val confinedOpenMutation : fspath -> string list -> confined_handle option
+val confinedOpenMutationDirectory : confined_handle -> string -> confined_handle option
+val confinedEnsureMutationDirectory : confined_handle -> string -> confined_handle
+
+(* Compare the exact bytes of a current regular child with [expected], then
+ * atomically publish [contents] through a staged [name.lock] file.  [None]
+ * requires that [name] be absent.  [confinedCasDelete] deletes the already
+ * opened, byte-checked child.  Neither operation follows reparse points or
+ * reopens a checked pathname. *)
+val confinedCasReplace :
+  confined_handle -> string -> string option -> string -> confined_cas
+val confinedCasDelete : confined_handle -> string -> string -> confined_cas
 
 (* Inflate one zlib stream beginning at [offset], returning its bytes and the
  * number of source bytes consumed.  Windows implements this without invoking

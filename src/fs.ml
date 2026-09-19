@@ -23,6 +23,8 @@ type confined_kind = System.confined_kind = ConfinedFile | ConfinedDirectory
 type confined_handle = System.confined_handle
 type confined_install = System.confined_install =
   ConfinedInstalled | ConfinedAlreadyPresent
+type confined_cas = System.confined_cas =
+  ConfinedChanged | ConfinedMismatch | ConfinedBusy
 
 let path p = Fspath.toString p |> System.extendedPath
 
@@ -61,6 +63,11 @@ let confinedClose = System.confinedClose
 let confinedEnsureDirectory = System.confinedEnsureDirectory
 let confinedOpenWritableDirectory = System.confinedOpenWritableDirectory
 let confinedInstall = System.confinedInstall
+let confinedOpenMutation f components = System.confinedOpenMutation (path f) components
+let confinedOpenMutationDirectory = System.confinedOpenMutationDirectory
+let confinedEnsureMutationDirectory = System.confinedEnsureMutationDirectory
+let confinedCasReplace = System.confinedCasReplace
+let confinedCasDelete = System.confinedCasDelete
 let confinedInflateZlib = System.confinedInflateZlib
 
 let openfile f flags perms = System.openfile (path f) flags perms

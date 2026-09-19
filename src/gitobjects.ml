@@ -907,6 +907,50 @@ let snapshotHashLength snapshot =
     | Some previous when previous = current -> length
     | Some _ -> fail "Git snapshot mixes SHA-1 and SHA-256 object ids") roots None
 
+let validateSnapshot ~repository snapshot =
+  try
+    if not Sys.win32 then
+      Error "Git object validation requires the native Windows confinement backend"
+    else begin
+      let store = openStore repository in
+      protect (fun () -> closeStore store) (fun () ->
+        begin match Gitrepo.inspect repository with
+        | Gitrepo.Ready current ->
+            begin match snapshotHashLength snapshot, snapshotHashLength current with
+            | Some desiredLength, Some currentLength when desiredLength <> currentLength ->
+                fail "repository Git object format differs from the desired snapshot"
+            | _ -> ()
+            end
+        | Gitrepo.Busy message -> fail ("Git repository is busy: " ^ message)
+        | Gitrepo.Missing -> fail "Git repository is missing"
+        | Gitrepo.Unsupported message -> fail ("Git repository is unsupported: " ^ message)
+        end;
+        let queue = Queue.create () in
+        StringSet.iter (fun oid -> Queue.push oid queue) (snapshotRoots snapshot);
+        let visited = Hashtbl.create 251 in
+        while not (Queue.is_empty queue) do
+          let oid = Queue.pop queue |> lowercase in
+          if not (Hashtbl.mem visited oid) then begin
+            if Hashtbl.length visited >= traversalLimit then
+              fail "Git object graph exceeds the transfer limit";
+            Hashtbl.add visited oid ();
+            let decoded = resolveObject store oid 0 in
+            List.iter (fun child -> Queue.push child queue)
+              (objectChildren oid decoded)
+          end
+        done;
+        Ok (Hashtbl.length visited))
+    end
+  with
+  | Unsupported message -> Error message
+  | Util.Transient message -> Error message
+  | Unix.Unix_error (error, operation, path) ->
+      Error (Printf.sprintf "%s failed for %s: %s" operation path
+        (Unix.error_message error))
+  | Sys_error message -> Error message
+  | Failure message -> Error message
+  | Invalid_argument message -> Error message
+
 let transfer ~source ~destination snapshot =
   try
     if not Sys.win32 then Error "Git object transfer requires the native Windows confinement backend"
